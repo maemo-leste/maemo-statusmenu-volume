@@ -1,0 +1,5 @@
+[Desktop Entry]
+Name=Profiles
+Comment=Volume Status Menu item
+Type=default
+X-Path=volume_status_menu_item.so

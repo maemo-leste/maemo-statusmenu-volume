@@ -1,0 +1,5 @@
+[normal]
+sink_name=sink.hw0
+sink_property=x-maemo.alsa_sink.mixer_tuning
+[incall]
+sink_property=x-maemo.alsa_sink.alt_mixer_tuning
