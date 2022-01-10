@@ -1,5 +1,6 @@
 [normal]
-sink_name=sink.hw0
-sink_property=x-maemo.alsa_sink.mixer_tuning
+sink_name=alsa_output.0.HiFi__hw_Audio_0__sink
 [incall]
 sink_property=x-maemo.alsa_sink.alt_mixer_tuning
+[behavior]
+swap_on_rotate=0
