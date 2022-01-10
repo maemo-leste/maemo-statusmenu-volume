@@ -67,6 +67,7 @@ struct _SoundsStatusMenuItemPrivate
   gboolean call_volume_set;
   gboolean call_active;
   gboolean portrait;
+  guint8 normal_channels;
   gchar *normal_sink_name;
   gchar *normal_sink_property;
   gchar *incall_sink_property;
@@ -78,7 +79,6 @@ struct _SoundsStatusMenuItemPrivate
   GQuark quark_incall;
   pa_mainloop_api *pa_api;
   pa_operation *pa_operation;
-  guint set_volume_id;
   gboolean parent_signals_connected;
   gboolean parent_window_mapped;
   guint mm_key;
@@ -571,28 +571,6 @@ screen_size_changed_cb(GdkScreen *screen, gpointer user_data)
       gdk_screen_get_height(screen) > gdk_screen_get_width(screen);
 }
 
-static void
-server_info_cb(pa_context *c, const pa_server_info *i,
-               void *userdata)
-{
-  SoundsStatusMenuItem *menu_item = userdata;
-  SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
-
-  if (!i)
-    return;
-
-  if (priv->default_sink_name)
-  {
-    if (!g_str_equal(priv->default_sink_name, i->default_sink_name))
-    {
-      g_free(priv->default_sink_name);
-      priv->default_sink_name = g_strdup(i->default_sink_name);
-    }
-  }
-  else
-    priv->default_sink_name = g_strdup(i->default_sink_name);
-}
-
 static gboolean
 is_running(SoundsStatusMenuItem *menu_item)
 {
@@ -701,12 +679,7 @@ context_subscribe_cb(pa_context *c, pa_subscription_event_type_t t,
   SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
   pa_operation *o;
 
-  if (t == PA_SUBSCRIPTION_EVENT_SERVER)
-  {
-    o = pa_context_get_server_info(c, server_info_cb, menu_item);
-    pa_operation_unref(o);
-  }
-  else if (t == PA_SUBSCRIPTION_EVENT_CHANGE)
+  if (t == PA_SUBSCRIPTION_EVENT_CHANGE)
   {
     o = pa_context_get_sink_info_by_name(c, priv->normal_sink_name,
                                          prop_sink_info_cb, menu_item);
@@ -718,6 +691,7 @@ static void
 context_state_callback(pa_context *c, void *userdata)
 {
   SoundsStatusMenuItem *menu_item = userdata;
+  SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
   pa_context_state_t state;
 
   g_assert(c);
@@ -730,12 +704,7 @@ context_state_callback(pa_context *c, void *userdata)
   {
     if (state == PA_CONTEXT_READY)
     {
-      pa_operation *o =
-          pa_context_get_server_info(c, server_info_cb, menu_item);
-
-      if (o)
-        pa_operation_unref(o);
-
+      pa_operation *o;
       o = pa_ext_stream_restore_test(c, ext_stream_restore_test_cb, menu_item);
 
       if (o)
@@ -751,6 +720,14 @@ context_state_callback(pa_context *c, void *userdata)
 
       if (o)
         pa_operation_unref(o);
+
+      o = pa_context_get_sink_info_by_name(priv->pa_context, priv->normal_sink_name,
+                                       prop_sink_info_cb, menu_item);
+      if (o)
+        pa_operation_unref(o);
+      else
+        g_warning("Pulse audio failure: %s %s",
+                  pa_strerror(pa_context_errno(priv->pa_context)), priv->normal_sink_name);
     }
     else
       reconnect(menu_item);
@@ -1023,6 +1000,13 @@ parse_tuning_property(const gchar *property, gint *num_steps_out,
   return TRUE;
 }
 
+static
+void error_callback(pa_context *c, int success, void *userdata)
+{
+    if (!success) 
+        g_warning("Pulse audio failure: %s", pa_strerror(pa_context_errno(c)));
+}
+
 static void
 prop_sink_info_cb(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
 {
@@ -1037,11 +1021,14 @@ prop_sink_info_cb(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
   int mm_key_pressed;
   double current_vol;
   double new_vol;
+  
+  g_assert((priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item)));
+  
+  if (i && priv->normal_channels == 0 && g_str_equal(priv->normal_sink_name, i->name))
+    priv->normal_channels = i->channel_map.channels;
 
   if (eol)
     return;
-
-  g_assert((priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item)));
 
   prop_normal = pa_proplist_gets(i->proplist, priv->normal_sink_property);
   prop_incall = pa_proplist_gets(i->proplist, priv->incall_sink_property);
@@ -1126,79 +1113,6 @@ out:
 }
 
 static void
-restore_info_set_volume(pa_ext_stream_restore_info *i, pa_volume_t vol)
-{
-  pa_cvolume a;
-
-  g_return_if_fail(i);
-
-  pa_cvolume_init(&a);
-  pa_cvolume_set(&a, 1, vol);
-  i->channel_map.channels = 1;
-  i->channel_map.map[0] = 0;
-  i->mute = 0;
-  i->device = NULL;
-  memcpy(&i->volume, &a, sizeof(a));
-}
-
-static gboolean
-set_volume_timeout(gpointer user_data)
-{
-  SoundsStatusMenuItem *menu_item = user_data;
-  SoundsStatusMenuItemPrivate *priv;
-  unsigned int n = 0;
-  pa_operation *o;
-  pa_ext_stream_restore_info infos[2];
-
-  g_return_val_if_fail(menu_item, FALSE);
-
-  priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
-
-
-  if (priv->call_volume_set && !priv->normal_volume_set)
-  {
-    priv->set_volume_id = 0;
-    return FALSE;
-  }
-
-  if (priv->slider_changed)
-  {
-    priv->normal_volume = slider_to_pa_vol(priv->range_val,
-                                           priv->normal_volume_steps,
-                                           priv->normal_volume_num_steps);
-
-    priv->slider_changed = FALSE;
-  }
-
-  if (priv->call_volume_set)
-  {
-    infos[n].name = "sink-input-by-media-role:phone";
-    restore_info_set_volume(&infos[n++], priv->call_volume);
-    priv->call_volume_set = FALSE;
-  }
-
-  if (priv->normal_volume_set)
-  {
-    infos[n].name = "sink-input-by-media-role:x-maemo";
-    restore_info_set_volume(&infos[n++], priv->normal_volume);
-    priv->normal_volume_set = FALSE;
-  }
-
-  o = pa_ext_stream_restore_write(priv->pa_context, PA_UPDATE_REPLACE, infos, n,
-                                  TRUE, NULL, NULL);
-
-  if (!o)
-    g_warning("pa_ext_stream_restore_write() failed");
-
-  if (priv->pa_operation)
-    pa_operation_unref(priv->pa_operation);
-
-  priv->pa_operation = o;
-
-  return TRUE;
-}
-
-static void
 set_volume(SoundsStatusMenuItem *menu_item, int volume)
 {
   SoundsStatusMenuItemPrivate *priv;
@@ -1214,14 +1128,20 @@ set_volume(SoundsStatusMenuItem *menu_item, int volume)
   }
   else
   {
+    pa_cvolume cv;
     priv->normal_volume = volume;
     priv->normal_volume_set = TRUE;
-  }
+    for (guint8 i = 0; i < priv->normal_channels; ++i)
+      cv.values[i] = volume;
+    cv.channels = priv->normal_channels;
+    pa_operation *o;
 
-  if (!priv->set_volume_id)
-  {
-    set_volume_timeout(menu_item);
-    priv->set_volume_id = g_timeout_add(500, set_volume_timeout, menu_item);
+    o = pa_context_set_sink_volume_by_name(priv->pa_context, priv->normal_sink_name, &cv, error_callback, NULL);
+    if (o)
+      pa_operation_unref(o);
+    else 
+      g_warning("Pulse audio failure: %s %s",
+                pa_strerror(pa_context_errno(priv->pa_context)), priv->normal_sink_name);
   }
 }
 
@@ -1335,7 +1255,6 @@ sounds_status_menu_item_init(SoundsStatusMenuItem *menu_item)
   XSetErrorHandler(x_error_handler);
 
   priv->volume_changed = FALSE;
-  priv->default_sink_name = NULL;
   priv->call_active = FALSE;
   priv->pa_context = NULL;
   priv->pa_operation = NULL;
@@ -1344,6 +1263,7 @@ sounds_status_menu_item_init(SoundsStatusMenuItem *menu_item)
   priv->mm_key = 0;
   priv->mm_key_pressed = FALSE;
   priv->icon = NULL;
+  priv->normal_channels = 0;
 
   get_sinks(priv);
   create_volume_steps(priv);
