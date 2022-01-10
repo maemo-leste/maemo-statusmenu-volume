@@ -88,7 +88,7 @@ struct _SoundsStatusMenuItemPrivate
   gboolean swap_on_rotate;
   gboolean native_landscape;
   gboolean display_on;
-  gboolean keys_are_grabed;
+  gboolean keys_are_grabbed;
 };
 
 struct _SoundsStatusMenuItem
@@ -131,7 +131,7 @@ grab_keys(SoundsStatusMenuItemPrivate *priv)
            GrabModeAsync);
   XGrabKey(GDK_DISPLAY(), X_KEYCODE_DOWN, AnyModifier, w, True, GrabModeAsync,
            GrabModeAsync);
-  priv->keys_are_grabed = TRUE;
+  priv->keys_are_grabbed = TRUE;
 }
 
 static void
@@ -139,7 +139,7 @@ ungrab_keys(SoundsStatusMenuItemPrivate *priv)
 {
   XUngrabKey(GDK_DISPLAY(), X_KEYCODE_UP, AnyModifier, GDK_ROOT_WINDOW());
   XUngrabKey(GDK_DISPLAY(), X_KEYCODE_DOWN, AnyModifier, GDK_ROOT_WINDOW());
-  priv->keys_are_grabed = FALSE;
+  priv->keys_are_grabbed = FALSE;
 }
 
 static Window
@@ -365,7 +365,7 @@ dbus_filter(DBusConnection *connection, DBusMessage *message, void *user_data)
                               DBUS_TYPE_INT32, &value,
                               DBUS_TYPE_INVALID))
     {
-      if (priv->keys_are_grabed &&
+      if (priv->keys_are_grabbed &&
         !priv->volume_changed &&
         (hw_keycode == HW_KEYCODE_UP || hw_keycode == HW_KEYCODE_DOWN) &&
         value)
@@ -442,7 +442,7 @@ sounds_status_menu_item_dispose(GObject *object)
 {
   SoundsStatusMenuItem *menu_item = SOUND_STATUS_MENU_ITEM(object);
   SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
-  
+
   gdk_window_remove_filter(0, gdk_filter_func, menu_item);
 
   if (priv->pa_context)
@@ -1241,7 +1241,7 @@ sounds_status_menu_item_init(SoundsStatusMenuItem *menu_item)
   priv->normal_channels = 0;
   priv->swap_on_rotate = FALSE;
   priv->display_on = TRUE;
-  priv->keys_are_grabed = FALSE;
+  priv->keys_are_grabbed = FALSE;
   priv->native_landscape = FALSE;
 
   get_sinks(priv);
