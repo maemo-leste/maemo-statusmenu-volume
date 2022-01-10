@@ -21,7 +21,7 @@
 #include <math.h>
 #include <string.h>
 
-#define KEY_FILE "/usr/share/maemo-statusmenu-volume/volume_steps_update"
+#define KEY_FILE "/usr/share/maemo-statusmenu-volume/sinks.ini"
 
 #define SOUND_STATUS_MENU_TYPE_ITEM (sounds_status_menu_item_get_type())
 #define SOUND_STATUS_MENU_ITEM(obj) (G_TYPE_CHECK_INSTANCE_CAST ((obj), \
