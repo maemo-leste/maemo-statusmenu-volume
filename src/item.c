@@ -16,6 +16,7 @@
 #include <systemui/tklock-dbus-names.h>
 #include <X11/Xatom.h>
 #include <X11/Xlib.h>
+#include <X11/XF86keysym.h>
 
 #include <math.h>
 #include <string.h>
@@ -44,8 +45,9 @@
   "interface='" MCE_SIGNAL_IF "'," \
   "member='" MCE_CALL_STATE_SIG "'"
 
-#define KEYCODE_F7 (XKeysymToKeycode(GDK_DISPLAY(), XK_F7))
-#define KEYCODE_F8 (XKeysymToKeycode(GDK_DISPLAY(), XK_F8))
+#define KEYCODE_DOWN (XKeysymToKeycode(GDK_DISPLAY(), XF86XK_AudioLowerVolume))
+#define KEYCODE_UP (XKeysymToKeycode(GDK_DISPLAY(), XF86XK_AudioRaiseVolume))
+
 
 typedef struct _SoundsStatusMenuItem SoundsStatusMenuItem;
 typedef struct _SoundsStatusMenuItemClass SoundsStatusMenuItemClass;
@@ -86,6 +88,7 @@ struct _SoundsStatusMenuItemPrivate
   gulong size_changed_id;
   GtkWidget *event_box;
   GdkPixbuf *icon;
+  gboolean swap_on_rotate;
 };
 
 struct _SoundsStatusMenuItem
@@ -124,17 +127,17 @@ grab_keys()
 {
   Window w = GDK_ROOT_WINDOW();
 
-  XGrabKey(GDK_DISPLAY(), KEYCODE_F7, AnyModifier, w, True, GrabModeAsync,
+  XGrabKey(GDK_DISPLAY(), KEYCODE_UP, AnyModifier, w, True, GrabModeAsync,
            GrabModeAsync);
-  XGrabKey(GDK_DISPLAY(), KEYCODE_F8, AnyModifier, w, True, GrabModeAsync,
+  XGrabKey(GDK_DISPLAY(), KEYCODE_DOWN, AnyModifier, w, True, GrabModeAsync,
            GrabModeAsync);
 }
 
 static void
 ungrab_keys()
 {
-  XUngrabKey(GDK_DISPLAY(), KEYCODE_F7, AnyModifier, GDK_ROOT_WINDOW());
-  XUngrabKey(GDK_DISPLAY(), KEYCODE_F8, AnyModifier, GDK_ROOT_WINDOW());
+  XUngrabKey(GDK_DISPLAY(), KEYCODE_UP, AnyModifier, GDK_ROOT_WINDOW());
+  XUngrabKey(GDK_DISPLAY(), KEYCODE_DOWN, AnyModifier, GDK_ROOT_WINDOW());
 }
 
 static Window
@@ -434,7 +437,7 @@ gdk_filter_func(GdkXEvent *xevent, GdkEvent *event, gpointer data)
   if (xev->type != KeyPress)
     return GDK_FILTER_CONTINUE;
 
-  if ((xev->xkey.keycode != KEYCODE_F7 && xev->xkey.keycode != KEYCODE_F8) ||
+  if ((xev->xkey.keycode != KEYCODE_UP && xev->xkey.keycode != KEYCODE_DOWN) ||
       priv->volume_changed)
   {
     return GDK_FILTER_CONTINUE;
@@ -528,6 +531,8 @@ get_sinks(SoundsStatusMenuItemPrivate *priv)
       g_error_free(error);
       error = NULL;
     }
+
+    priv->swap_on_rotate = g_key_file_get_boolean(key_file, "behavior", "swap_on_rotate", NULL);
   }
 
   g_key_file_free(key_file);
@@ -1002,7 +1007,6 @@ prop_sink_info_cb(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
   SoundsStatusMenuItem *menu_item = userdata;
   SoundsStatusMenuItemPrivate *priv;
   gboolean volume_changed = FALSE;
-  const char *prop_normal;
   const char *prop_incall;
   gint *volume;
   gint steps_size;
@@ -1020,9 +1024,6 @@ prop_sink_info_cb(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
     return;
 
   prop_incall = pa_proplist_gets(i->proplist, priv->incall_sink_property);
-
-  parse_tuning_property(prop_normal, &priv->normal_volume_num_steps,
-                        &priv->normal_volume_steps, &priv->quark_normal);
 
   parse_tuning_property(prop_incall,&priv->incall_volume_num_steps,
                         &priv->incall_volume_steps, &priv->quark_incall);
@@ -1046,14 +1047,20 @@ prop_sink_info_cb(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
   mm_key_pressed = priv->mm_key_pressed;
   current_vol = pa_vol_to_slider(*volume, steps, steps_size);
 
-  if ((priv->portrait && priv->mm_key == KEYCODE_F7) ||
-      (!priv->portrait && priv->mm_key == KEYCODE_F8))
+  if (!priv->portrait && priv->swap_on_rotate)
+  {
+    if (priv->mm_key == KEYCODE_UP)
+      priv->mm_key = KEYCODE_DOWN;
+    else if (priv->mm_key == KEYCODE_DOWN)
+      priv->mm_key = KEYCODE_UP;
+  }
+
+  if (priv->mm_key == KEYCODE_UP)
   {
     new_vol = slider_volume_increase_step(menu_item, current_vol);
     volume_changed = TRUE;
   }
-  else if ((!priv->portrait && priv->mm_key == KEYCODE_F7) ||
-           (priv->portrait && priv->mm_key == KEYCODE_F8))
+  else if (priv->mm_key == KEYCODE_DOWN)
   {
     new_vol = slider_volume_decrease_step(menu_item, current_vol);
     volume_changed = TRUE;
@@ -1252,6 +1259,7 @@ sounds_status_menu_item_init(SoundsStatusMenuItem *menu_item)
   priv->mm_key_pressed = FALSE;
   priv->icon = NULL;
   priv->normal_channels = 0;
+  priv->swap_on_rotate = FALSE;
 
   get_sinks(priv);
   create_volume_steps(priv);
