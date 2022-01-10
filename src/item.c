@@ -13,15 +13,15 @@
 #include <pulse/glib-mainloop.h>
 #include <pulse/introspect.h>
 #include <pulse/subscribe.h>
-#include <systemui/tklock-dbus-names.h>
 #include <X11/Xatom.h>
 #include <X11/Xlib.h>
 #include <X11/XF86keysym.h>
+#include <linux/input.h>
 
 #include <math.h>
 #include <string.h>
 
-#define KEY_FILE "/usr/share/maemo-statusmenu-volume/sinks.ini"
+#define CONFIGURATION_FILE "/usr/share/maemo-statusmenu-volume/sinks.ini"
 
 #define SOUND_STATUS_MENU_TYPE_ITEM (sounds_status_menu_item_get_type())
 #define SOUND_STATUS_MENU_ITEM(obj) (G_TYPE_CHECK_INSTANCE_CAST ((obj), \
@@ -35,18 +35,16 @@
   ((SoundsStatusMenuItemPrivate *)sounds_status_menu_item_get_instance_private(menu_item))
 #endif
 
-#define DBUS_TKLOCK_MATCH_RULE \
-  "type='signal'," \
-  "interface='" TKLOCK_SIGNAL_IF "'," \
-  "member='" TKLOCK_MM_KEY_PRESS_SIG "'"
-
 #define DBUS_MCE_MATCH_RULE \
   "type='signal'," \
   "interface='" MCE_SIGNAL_IF "'," \
   "member='" MCE_CALL_STATE_SIG "'"
 
-#define KEYCODE_DOWN (XKeysymToKeycode(GDK_DISPLAY(), XF86XK_AudioLowerVolume))
-#define KEYCODE_UP (XKeysymToKeycode(GDK_DISPLAY(), XF86XK_AudioRaiseVolume))
+#define X_KEYCODE_DOWN (XKeysymToKeycode(GDK_DISPLAY(), XF86XK_AudioLowerVolume))
+#define X_KEYCODE_UP (XKeysymToKeycode(GDK_DISPLAY(), XF86XK_AudioRaiseVolume))
+  
+#define HW_KEYCODE_DOWN KEY_VOLUMEDOWN
+#define HW_KEYCODE_UP KEY_VOLUMEUP
 
 
 typedef struct _SoundsStatusMenuItem SoundsStatusMenuItem;
@@ -83,12 +81,14 @@ struct _SoundsStatusMenuItemPrivate
   gboolean parent_signals_connected;
   gboolean parent_window_mapped;
   guint mm_key;
-  gboolean mm_key_pressed;
   gboolean volume_changed;
   gulong size_changed_id;
   GtkWidget *event_box;
   GdkPixbuf *icon;
   gboolean swap_on_rotate;
+  gboolean native_landscape;
+  gboolean display_on;
+  gboolean keys_are_grabed;
 };
 
 struct _SoundsStatusMenuItem
@@ -123,21 +123,23 @@ sounds_status_menu_item_class_finalize(SoundsStatusMenuItemClass *klass)
 }
 
 static void
-grab_keys()
+grab_keys(SoundsStatusMenuItemPrivate *priv)
 {
   Window w = GDK_ROOT_WINDOW();
 
-  XGrabKey(GDK_DISPLAY(), KEYCODE_UP, AnyModifier, w, True, GrabModeAsync,
+  XGrabKey(GDK_DISPLAY(), X_KEYCODE_UP, AnyModifier, w, True, GrabModeAsync,
            GrabModeAsync);
-  XGrabKey(GDK_DISPLAY(), KEYCODE_DOWN, AnyModifier, w, True, GrabModeAsync,
+  XGrabKey(GDK_DISPLAY(), X_KEYCODE_DOWN, AnyModifier, w, True, GrabModeAsync,
            GrabModeAsync);
+  priv->keys_are_grabed = TRUE;
 }
 
 static void
-ungrab_keys()
+ungrab_keys(SoundsStatusMenuItemPrivate *priv)
 {
-  XUngrabKey(GDK_DISPLAY(), KEYCODE_UP, AnyModifier, GDK_ROOT_WINDOW());
-  XUngrabKey(GDK_DISPLAY(), KEYCODE_DOWN, AnyModifier, GDK_ROOT_WINDOW());
+  XUngrabKey(GDK_DISPLAY(), X_KEYCODE_UP, AnyModifier, GDK_ROOT_WINDOW());
+  XUngrabKey(GDK_DISPLAY(), X_KEYCODE_DOWN, AnyModifier, GDK_ROOT_WINDOW());
+  priv->keys_are_grabed = FALSE;
 }
 
 static Window
@@ -213,16 +215,16 @@ grab_zoom(SoundsStatusMenuItem *menu_item)
 
     if (val && *val && !priv->parent_window_mapped)
     {
-      ungrab_keys();
+      ungrab_keys(priv);
       XFree(val);
     }
     else
-      grab_keys();
+      grab_keys(priv);
 
     return TRUE;
   }
 
-  grab_keys();
+  grab_keys(priv);
 
   return FALSE;
 }
@@ -353,24 +355,24 @@ dbus_filter(DBusConnection *connection, DBusMessage *message, void *user_data)
   SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
   DBusError error = DBUS_ERROR_INIT;
 
-  if (dbus_message_is_signal(
-        message, TKLOCK_SIGNAL_IF, TKLOCK_MM_KEY_PRESS_SIG))
+  if (dbus_message_is_signal(message, MCE_SIGNAL_IF, MCE_KEY_SIG))
   {
-    guint key;
-    guint hw_keycode;
+    guint16 hw_keycode;
+    gint32 value;
 
     if (dbus_message_get_args(message, &error,
-                              DBUS_TYPE_UINT32, &hw_keycode,
-                              DBUS_TYPE_UINT32, &key,
+                              DBUS_TYPE_UINT16, &hw_keycode,
+                              DBUS_TYPE_INT32, &value,
                               DBUS_TYPE_INVALID))
     {
-
-      if (!priv->volume_changed)
+      if (priv->keys_are_grabed &&
+        !priv->volume_changed &&
+        (hw_keycode == HW_KEYCODE_UP || hw_keycode == HW_KEYCODE_DOWN) &&
+        value)
       {
         pa_operation *o;
 
-        priv->mm_key = hw_keycode;
-        priv->mm_key_pressed = TRUE;
+        priv->mm_key = (hw_keycode == HW_KEYCODE_UP ? X_KEYCODE_UP : X_KEYCODE_DOWN);
         o = pa_context_get_sink_info_by_name(priv->pa_context,
                                              priv->normal_sink_name,
                                              prop_sink_info_cb,
@@ -393,25 +395,29 @@ dbus_filter(DBusConnection *connection, DBusMessage *message, void *user_data)
                               DBUS_TYPE_STRING, &type,
                               DBUS_TYPE_INVALID))
     {
-      if (g_str_equal(state, MCE_CALL_STATE_ACTIVE))
-      {
-        priv->call_active = TRUE;
-        dbus_bus_add_match(
-              dbus_g_connection_get_connection(priv->dbus),
-              "type='signal',interface='" TKLOCK_SIGNAL_IF "'", NULL);
-      }
-      else
-      {
-        priv->call_active = FALSE;
-        dbus_bus_remove_match(
-              dbus_g_connection_get_connection(priv->dbus),
-              "type='signal',interface='" TKLOCK_SIGNAL_IF "'", NULL);
-      }
-
+      priv->call_active = g_str_equal(state, MCE_CALL_STATE_ACTIVE);
       update_slider(menu_item);
     }
     else if (error.message)
+    {
       g_warning("%s", error.message);
+    }
+  }
+  else if (dbus_message_is_signal(message, MCE_SIGNAL_IF, MCE_DISPLAY_SIG))
+  {
+    const gchar *state;
+
+    if (dbus_message_get_args(message, &error,
+                              DBUS_TYPE_STRING, &state,
+                              DBUS_TYPE_INVALID))
+    {
+      priv->display_on = g_str_equal(state, MCE_DISPLAY_ON_STRING);
+      update_slider(menu_item);
+    }
+    else if (error.message)
+    {
+      g_warning("%s", error.message);
+    }
   }
 
   dbus_error_free(&error);
@@ -423,34 +429,12 @@ static GdkFilterReturn
 gdk_filter_func(GdkXEvent *xevent, GdkEvent *event, gpointer data)
 {
   SoundsStatusMenuItem *menu_item = data;
-  SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
   XEvent *xev = (XEvent *)xevent;
 
-  pa_operation *o;
-
   if (xev->type == PropertyNotify)
-  {
-    if (!grab_zoom(menu_item))
-      return GDK_FILTER_CONTINUE;
-  }
+    grab_zoom(menu_item);
 
-  if (xev->type != KeyPress)
-    return GDK_FILTER_CONTINUE;
-
-  if ((xev->xkey.keycode != KEYCODE_UP && xev->xkey.keycode != KEYCODE_DOWN) ||
-      priv->volume_changed)
-  {
-    return GDK_FILTER_CONTINUE;
-  }
-
-  priv->mm_key = xev->xkey.keycode;
-
-  o = pa_context_get_sink_info_by_name(priv->pa_context, priv->normal_sink_name,
-                                       prop_sink_info_cb, menu_item);
-  if (o)
-    pa_operation_unref(o);
-
-  return GDK_FILTER_REMOVE;
+  return GDK_FILTER_CONTINUE;
 }
 
 static void
@@ -458,7 +442,7 @@ sounds_status_menu_item_dispose(GObject *object)
 {
   SoundsStatusMenuItem *menu_item = SOUND_STATUS_MENU_ITEM(object);
   SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
-
+  
   gdk_window_remove_filter(0, gdk_filter_func, menu_item);
 
   if (priv->pa_context)
@@ -510,7 +494,7 @@ get_sinks(SoundsStatusMenuItemPrivate *priv)
   GKeyFile *key_file = g_key_file_new();
   GError *error = NULL;
 
-  if (g_key_file_load_from_file(key_file, KEY_FILE, G_KEY_FILE_NONE, NULL) )
+  if (g_key_file_load_from_file(key_file, CONFIGURATION_FILE, G_KEY_FILE_NONE, NULL) )
   {
     priv->normal_sink_name =
         g_key_file_get_string(key_file, "normal", "sink_name", &error);
@@ -533,6 +517,7 @@ get_sinks(SoundsStatusMenuItemPrivate *priv)
     }
 
     priv->swap_on_rotate = g_key_file_get_boolean(key_file, "behavior", "swap_on_rotate", NULL);
+    priv->native_landscape = g_key_file_get_boolean(key_file, "behavior", "native_is_landscape", NULL);
   }
 
   g_key_file_free(key_file);
@@ -1011,7 +996,6 @@ prop_sink_info_cb(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
   gint *volume;
   gint steps_size;
   gint *steps;
-  int mm_key_pressed;
   double current_vol;
   double new_vol;
   
@@ -1044,23 +1028,23 @@ prop_sink_info_cb(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
     steps_size = priv->normal_volume_num_steps;
   }
 
-  mm_key_pressed = priv->mm_key_pressed;
   current_vol = pa_vol_to_slider(*volume, steps, steps_size);
-
-  if (!priv->portrait && priv->swap_on_rotate)
+  
+  if ((!priv->portrait && priv->swap_on_rotate && priv->display_on) ||
+    (!priv->display_on && priv->native_landscape))
   {
-    if (priv->mm_key == KEYCODE_UP)
-      priv->mm_key = KEYCODE_DOWN;
-    else if (priv->mm_key == KEYCODE_DOWN)
-      priv->mm_key = KEYCODE_UP;
+    if (priv->mm_key == X_KEYCODE_UP)
+      priv->mm_key = X_KEYCODE_DOWN;
+    else if (priv->mm_key == X_KEYCODE_DOWN)
+      priv->mm_key = X_KEYCODE_UP;
   }
 
-  if (priv->mm_key == KEYCODE_UP)
+  if (priv->mm_key == X_KEYCODE_UP)
   {
     new_vol = slider_volume_increase_step(menu_item, current_vol);
     volume_changed = TRUE;
   }
-  else if (priv->mm_key == KEYCODE_DOWN)
+  else if (priv->mm_key == X_KEYCODE_DOWN)
   {
     new_vol = slider_volume_decrease_step(menu_item, current_vol);
     volume_changed = TRUE;
@@ -1075,8 +1059,7 @@ prop_sink_info_cb(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
     /* FIXME - why calling update_slider twice */
     if (priv->parent_window_mapped)
       update_slider(menu_item);
-    else if (!hildon_get_dnd(hildon_window_get_active_window()) &&
-             !mm_key_pressed)
+    else if (!hildon_get_dnd(hildon_window_get_active_window()))
     {
       update_slider(menu_item);
 
@@ -1096,8 +1079,6 @@ prop_sink_info_cb(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
       gtk_widget_queue_draw(priv->event_box);
       hildon_banner_show_custom_widget(GTK_WIDGET(menu_item), priv->event_box);
     }
-
-    priv->mm_key_pressed = FALSE;
   }
 
 out:
@@ -1171,7 +1152,7 @@ parent_window_map_cb(GtkWidget *widget, SoundsStatusMenuItem *menu_item)
   SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
   pa_operation *o;
 
-  grab_keys();
+  grab_keys(priv);
 
   o = pa_context_subscribe(
         priv->pa_context,
@@ -1256,19 +1237,21 @@ sounds_status_menu_item_init(SoundsStatusMenuItem *menu_item)
   priv->parent_signals_connected = FALSE;
   priv->parent_window_mapped = FALSE;
   priv->mm_key = 0;
-  priv->mm_key_pressed = FALSE;
   priv->icon = NULL;
   priv->normal_channels = 0;
   priv->swap_on_rotate = FALSE;
+  priv->display_on = TRUE;
+  priv->keys_are_grabed = FALSE;
+  priv->native_landscape = FALSE;
 
   get_sinks(priv);
   create_volume_steps(priv);
-  grab_keys();
+  grab_keys(priv);
 
   gdk_window_set_events(GDK_ROOT_PARENT(),
                         gdk_window_get_events(GDK_ROOT_PARENT()) |
-                           GDK_KEY_PRESS_MASK | GDK_PROPERTY_CHANGE_MASK);
-
+                        GDK_PROPERTY_CHANGE_MASK);
+  
   gdk_window_add_filter(0, gdk_filter_func, menu_item);
 
   screen = gdk_screen_get_default();
@@ -1293,7 +1276,6 @@ sounds_status_menu_item_init(SoundsStatusMenuItem *menu_item)
   conn = dbus_g_connection_get_connection(priv->dbus);
 
   dbus_bus_add_match(conn, DBUS_MCE_MATCH_RULE, NULL);
-  dbus_bus_add_match(conn, DBUS_TKLOCK_MATCH_RULE, NULL);
   dbus_connection_add_filter(conn, dbus_filter, menu_item, NULL);
 
   hbox = gtk_hbox_new(FALSE, 0);
