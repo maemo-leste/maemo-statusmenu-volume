@@ -1,3 +1,11 @@
+maemo-statusmenu-volume (0.55) unstable; urgency=low
+
+  * Switch to mce (as opposed to tklock) interface for volume control
+  * Call mode is untested
+  * Switch to UCM sinks for now (as opposed to sinks by role)
+
+ -- Merlijn Wajer <merlijn@wizzup.org>  Fri, 14 Jan 2022 22:53:59 +0100
+
 maemo-statusmenu-volume (0.54) unstable; urgency=low
 
   * First RE release
