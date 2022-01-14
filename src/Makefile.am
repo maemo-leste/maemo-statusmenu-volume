@@ -10,7 +10,7 @@ volume_status_menu_item_la_LIBADD = $(STATUS_MENU_VOLUME_LIBS) -lm
 volume_status_menu_item_la_SOURCES = item.c
 
 propertydir = $(datadir)/maemo-statusmenu-volume
-property_DATA = volume_steps_update
+property_DATA = sinks.ini
 
 hildonstatusmenudesktopentry_DATA = volume.desktop
 
