@@ -1,3 +1,9 @@
+maemo-statusmenu-volume (0.56) unstable; urgency=low
+
+  * Implement external volume events
+
+ -- Merlijn Wajer <merlijn@wizzup.org>  Wed, 02 Feb 2022 23:20:08 +0100
+
 maemo-statusmenu-volume (0.55) unstable; urgency=low
 
   * Switch to mce (as opposed to tklock) interface for volume control
