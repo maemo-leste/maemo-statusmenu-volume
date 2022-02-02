@@ -383,7 +383,7 @@ dbus_filter(DBusConnection *connection, DBusMessage *message, void *user_data)
       }
     }
     else if (error.message)
-      g_warning("%s", error.message);
+      g_warning("VOLUME: %s", error.message);
   }
   else if (dbus_message_is_signal(message, MCE_SIGNAL_IF, MCE_CALL_STATE_SIG))
   {
@@ -400,7 +400,7 @@ dbus_filter(DBusConnection *connection, DBusMessage *message, void *user_data)
     }
     else if (error.message)
     {
-      g_warning("%s", error.message);
+      g_warning("VOLUME: %s", error.message);
     }
   }
   else if (dbus_message_is_signal(message, MCE_SIGNAL_IF, MCE_DISPLAY_SIG))
@@ -416,7 +416,7 @@ dbus_filter(DBusConnection *connection, DBusMessage *message, void *user_data)
     }
     else if (error.message)
     {
-      g_warning("%s", error.message);
+      g_warning("VOLUME: %s", error.message);
     }
   }
 
@@ -501,7 +501,7 @@ get_sinks(SoundsStatusMenuItemPrivate *priv)
 
     if (error)
     {
-      g_warning("unable to get normal->sink_name [%s]", error->message);
+      g_warning("VOLUME: unable to get normal->sink_name [%s]", error->message);
       g_error_free(error);
       error = NULL;
     }
@@ -511,7 +511,7 @@ get_sinks(SoundsStatusMenuItemPrivate *priv)
 
     if (error)
     {
-      g_warning("unable to get incall->sink_property [%s]", error->message);
+      g_warning("VOLUME: unable to get incall->sink_property [%s]", error->message);
       g_error_free(error);
       error = NULL;
     }
@@ -582,7 +582,7 @@ ext_stream_restore_read_cb(pa_context *c,
 
   if (eol < 0)
   {
-    g_warning("Failed to initialized stream_restore extension: %s",
+    g_warning("VOLUME: Failed to initialized stream_restore extension: %s",
               pa_strerror(pa_context_errno(c)));
     return;
   }
@@ -624,7 +624,7 @@ pa_ext_stream_restore_subscribe_cb(pa_context *c, void *userdata)
   if (o)
     pa_operation_unref(o);
   else
-    g_warning("pa_ext_stream_restore_read() failed");
+    g_warning("VOLUME: pa_ext_stream_restore_read() failed");
 }
 
 static void
@@ -658,12 +658,25 @@ context_subscribe_cb(pa_context *c, pa_subscription_event_type_t t,
   SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
   pa_operation *o;
 
-  if (t == PA_SUBSCRIPTION_EVENT_CHANGE)
+  if (t == PA_SUBSCRIPTION_EVENT_CHANGE || t == PA_SUBSCRIPTION_EVENT_SINK)
   {
     o = pa_context_get_sink_info_by_name(c, priv->normal_sink_name,
                                          prop_sink_info_cb, menu_item);
     pa_operation_unref(o);
   }
+}
+
+static void pa_subscribe_events(pa_context *c)
+{
+  pa_operation *o;
+  o = pa_context_subscribe(c,
+                           PA_SUBSCRIPTION_MASK_SINK|
+                           PA_SUBSCRIPTION_MASK_SOURCE|
+                           PA_SUBSCRIPTION_MASK_SERVER,
+                           NULL,
+                           NULL);
+   if (o)
+     pa_operation_unref(o);
 }
 
 static void
@@ -690,22 +703,19 @@ context_state_callback(pa_context *c, void *userdata)
         pa_operation_unref(o);
       else
       {
-        g_critical("Failed to initialized stream_restore extension: %s",
+        g_critical("VOLUME: Failed to initialized stream_restore extension: %s",
                    pa_strerror(pa_context_errno(c)));
       }
 
       pa_context_set_subscribe_callback(c, context_subscribe_cb, menu_item);
-      o = pa_context_subscribe(c, PA_SUBSCRIPTION_MASK_SERVER, 0, menu_item);
-
-      if (o)
-        pa_operation_unref(o);
+      pa_subscribe_events(c);
 
       o = pa_context_get_sink_info_by_name(priv->pa_context, priv->normal_sink_name,
                                        prop_sink_info_cb, menu_item);
       if (o)
         pa_operation_unref(o);
       else
-        g_warning("Pulse audio failure: %s %s",
+        g_warning("VOLUME: Pulse audio failure: %s %s",
                   pa_strerror(pa_context_errno(priv->pa_context)), priv->normal_sink_name);
     }
     else
@@ -735,7 +745,7 @@ reconnect(SoundsStatusMenuItem *menu_item)
   if (pa_context_connect(priv->pa_context, NULL,
                          PA_CONTEXT_NOFAIL | PA_CONTEXT_NOAUTOSPAWN, NULL) < 0)
   {
-    g_warning("Failed to connect pa server: %s",
+    g_warning("VOLUME: Failed to connect pa server: %s",
               pa_strerror(pa_context_errno(priv->pa_context)));
   }
 }
@@ -983,7 +993,7 @@ static
 void error_callback(pa_context *c, int success, void *userdata)
 {
     if (!success) 
-        g_warning("Pulse audio failure: %s", pa_strerror(pa_context_errno(c)));
+        g_warning("VOLUME: Pulse audio failure: %s", pa_strerror(pa_context_errno(c)));
 }
 
 static void
@@ -993,7 +1003,7 @@ prop_sink_info_cb(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
   SoundsStatusMenuItemPrivate *priv;
   gboolean volume_changed = FALSE;
   const char *prop_incall;
-  gint *volume;
+  gint volume;
   gint steps_size;
   gint *steps;
   double current_vol;
@@ -1012,23 +1022,28 @@ prop_sink_info_cb(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
   parse_tuning_property(prop_incall,&priv->incall_volume_num_steps,
                         &priv->incall_volume_steps, &priv->quark_incall);
 
-  if (!priv->mm_key)
-    goto out;
-
   if (priv->call_active)
   {
-    volume = &priv->call_volume;
+    volume = priv->call_volume;
     steps = priv->incall_volume_steps;
     steps_size = priv->incall_volume_num_steps;
   }
   else
   {
-    volume = &priv->normal_volume;
+    if(!i->volume.channels)
+    {
+      g_warning("VOLUME: %s: can't set volume from sink with zero channels", __func__);
+      return;
+    }
+
+    volume = i->volume.values[0];
     steps = priv->normal_volume_steps;
     steps_size = priv->normal_volume_num_steps;
+    priv->normal_volume = volume;
+    g_debug("VOLUME: %s: normal volume is now %i", __func__, priv->normal_volume);
   }
 
-  current_vol = pa_vol_to_slider(*volume, steps, steps_size);
+  current_vol = pa_vol_to_slider(volume, steps, steps_size);
   
   if ((!priv->portrait && priv->swap_on_rotate && priv->display_on) ||
     (!priv->display_on && priv->native_landscape))
@@ -1056,10 +1071,7 @@ prop_sink_info_cb(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
     priv->volume_changed = TRUE;
     g_timeout_add(50, reset_volume_changed, menu_item);
 
-    /* FIXME - why calling update_slider twice */
-    if (priv->parent_window_mapped)
-      update_slider(menu_item);
-    else if (!hildon_get_dnd(hildon_window_get_active_window()))
+    if (!priv->parent_window_mapped && !hildon_get_dnd(hildon_window_get_active_window()))
     {
       update_slider(menu_item);
 
@@ -1081,7 +1093,6 @@ prop_sink_info_cb(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
     }
   }
 
-out:
   priv->mm_key = 0;
 
   if (priv->parent_window_mapped)
@@ -1116,7 +1127,7 @@ set_volume(SoundsStatusMenuItem *menu_item, int volume)
     if (o)
       pa_operation_unref(o);
     else 
-      g_warning("Pulse audio failure: %s %s",
+      g_warning("VOLUME: Pulse audio failure: %s %s",
                 pa_strerror(pa_context_errno(priv->pa_context)), priv->normal_sink_name);
   }
 }
@@ -1154,12 +1165,7 @@ parent_window_map_cb(GtkWidget *widget, SoundsStatusMenuItem *menu_item)
 
   grab_keys(priv);
 
-  o = pa_context_subscribe(
-        priv->pa_context,
-        PA_SUBSCRIPTION_MASK_SERVER | PA_SUBSCRIPTION_MASK_SINK, 0, menu_item);
-
-  if (o)
-    pa_operation_unref(o);
+  pa_subscribe_events(priv->pa_context);
 
   o = pa_context_get_sink_info_by_name(priv->pa_context, priv->normal_sink_name,
                                        prop_sink_info_cb, menu_item);
@@ -1175,12 +1181,7 @@ static void
 parent_window_unmap_cb(GtkWidget *widget, SoundsStatusMenuItem *menu_item)
 {
   SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
-  pa_operation *o = pa_context_subscribe(
-        priv->pa_context, PA_SUBSCRIPTION_MASK_SERVER, 0, menu_item);
   gboolean ret;
-
-  if (o)
-    pa_operation_unref(o);
 
   priv->parent_window_mapped = FALSE;
   g_signal_emit_by_name(priv->hscale, "grab-broken-event", NULL, &ret);
@@ -1269,7 +1270,7 @@ sounds_status_menu_item_init(SoundsStatusMenuItem *menu_item)
 
   if (!priv->dbus)
   {
-    g_warning("Failed to open connection to bus: %s", error->message);
+    g_warning("VOLUME: Failed to open connection to bus: %s", error->message);
     return;
   }
 
