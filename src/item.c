@@ -496,15 +496,7 @@ get_sinks(SoundsStatusMenuItemPrivate *priv)
 
   if (g_key_file_load_from_file(key_file, CONFIGURATION_FILE, G_KEY_FILE_NONE, NULL) )
   {
-    priv->normal_sink_name =
-        g_key_file_get_string(key_file, "normal", "sink_name", &error);
-
-    if (error)
-    {
-      g_warning("VOLUME: unable to get normal->sink_name [%s]", error->message);
-      g_error_free(error);
-      error = NULL;
-    }
+    priv->normal_sink_name = NULL;
 
     priv->incall_sink_property =
         g_key_file_get_string(key_file, "incall", "sink_property", &error);
@@ -680,6 +672,35 @@ static void pa_subscribe_events(pa_context *c)
 }
 
 static void
+context_get_server_info_cb(pa_context *c, const pa_server_info *i, void *userdata)
+{
+  SoundsStatusMenuItem *menu_item = userdata;
+  SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
+  pa_operation *o;
+
+
+  if (!i) {
+    g_warning("VOLUME: unable to get server info / default sink name: %s",
+            pa_strerror(pa_context_errno(c)));
+  }
+
+  if (priv->normal_sink_name) {
+    g_free(priv->normal_sink_name);
+    priv->normal_sink_name = NULL;
+  }
+  priv->normal_sink_name = g_strdup(i->default_sink_name);
+
+
+  o = pa_context_get_sink_info_by_name(priv->pa_context, priv->normal_sink_name,
+                                   prop_sink_info_cb, menu_item);
+  if (o)
+    pa_operation_unref(o);
+  else
+    g_warning("VOLUME: Pulse audio failure: %s %s",
+              pa_strerror(pa_context_errno(priv->pa_context)), priv->normal_sink_name);
+}
+
+static void
 context_state_callback(pa_context *c, void *userdata)
 {
   SoundsStatusMenuItem *menu_item = userdata;
@@ -710,13 +731,12 @@ context_state_callback(pa_context *c, void *userdata)
       pa_context_set_subscribe_callback(c, context_subscribe_cb, menu_item);
       pa_subscribe_events(c);
 
-      o = pa_context_get_sink_info_by_name(priv->pa_context, priv->normal_sink_name,
-                                       prop_sink_info_cb, menu_item);
-      if (o)
-        pa_operation_unref(o);
-      else
-        g_warning("VOLUME: Pulse audio failure: %s %s",
-                  pa_strerror(pa_context_errno(priv->pa_context)), priv->normal_sink_name);
+      pa_operation *operation = pa_context_get_server_info(priv->pa_context, context_get_server_info_cb, (void*)menu_item);
+      if (!operation) {
+        g_warning("VOLUME: Failed to create get_server_info operation: %s", pa_strerror(pa_context_errno(priv->pa_context)));
+        return;
+      }
+      pa_operation_unref(operation);
     }
     else
       reconnect(menu_item);
@@ -748,6 +768,7 @@ reconnect(SoundsStatusMenuItem *menu_item)
     g_warning("VOLUME: Failed to connect pa server: %s",
               pa_strerror(pa_context_errno(priv->pa_context)));
   }
+
 }
 
 static gint
