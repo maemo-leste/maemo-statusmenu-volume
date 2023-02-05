@@ -1,22 +1,22 @@
+#include <X11/XF86keysym.h>
+#include <X11/Xatom.h>
+#include <X11/Xlib.h>
 #include <dbus/dbus-glib-lowlevel.h>
 #include <gconf/gconf-client.h>
 #include <gdk/gdkx.h>
 #include <hildon/hildon.h>
 #include <libhildondesktop/libhildondesktop.h>
+#include <linux/input.h>
 #include <mce/dbus-names.h>
 #include <mce/mode-names.h>
+#include <pulse/channelmap.h>
 #include <pulse/context.h>
 #include <pulse/error.h>
-#include <pulse/channelmap.h>
-#include <pulse/volume.h>
 #include <pulse/ext-stream-restore.h>
 #include <pulse/glib-mainloop.h>
 #include <pulse/introspect.h>
 #include <pulse/subscribe.h>
-#include <X11/Xatom.h>
-#include <X11/Xlib.h>
-#include <X11/XF86keysym.h>
-#include <linux/input.h>
+#include <pulse/volume.h>
 
 #include <math.h>
 #include <string.h>
@@ -24,15 +24,19 @@
 #define CONFIGURATION_FILE "/usr/share/maemo-statusmenu-volume/sinks.ini"
 
 #define SOUND_STATUS_MENU_TYPE_ITEM (sounds_status_menu_item_get_type())
-#define SOUND_STATUS_MENU_ITEM(obj) (G_TYPE_CHECK_INSTANCE_CAST ((obj), \
-  SOUND_STATUS_MENU_TYPE_ITEM, SoundsStatusMenuItem))
+#define SOUND_STATUS_MENU_ITEM(obj) \
+  (G_TYPE_CHECK_INSTANCE_CAST((obj), \
+                              SOUND_STATUS_MENU_TYPE_ITEM, SoundsStatusMenuItem))
 
 #if !GLIB_CHECK_VERSION(2, 38, 0)
 #define SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item) \
-  G_TYPE_INSTANCE_GET_PRIVATE(menu_item, SOUND_STATUS_MENU_TYPE_ITEM, SoundsStatusMenuItemPrivate)
+  G_TYPE_INSTANCE_GET_PRIVATE(menu_item, \
+                              SOUND_STATUS_MENU_TYPE_ITEM, \
+                              SoundsStatusMenuItemPrivate)
 #else
 #define SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item) \
-  ((SoundsStatusMenuItemPrivate *)sounds_status_menu_item_get_instance_private(menu_item))
+  ((SoundsStatusMenuItemPrivate *)sounds_status_menu_item_get_instance_private( \
+     menu_item))
 #endif
 
 #define DBUS_MCE_MATCH_RULE \
@@ -42,10 +46,9 @@
 
 #define X_KEYCODE_DOWN (XKeysymToKeycode(GDK_DISPLAY(), XF86XK_AudioLowerVolume))
 #define X_KEYCODE_UP (XKeysymToKeycode(GDK_DISPLAY(), XF86XK_AudioRaiseVolume))
-  
+
 #define HW_KEYCODE_DOWN KEY_VOLUMEDOWN
 #define HW_KEYCODE_UP KEY_VOLUMEUP
-
 
 typedef struct _SoundsStatusMenuItem SoundsStatusMenuItem;
 typedef struct _SoundsStatusMenuItemClass SoundsStatusMenuItemClass;
@@ -69,6 +72,7 @@ struct _SoundsStatusMenuItemPrivate
   gboolean portrait;
   guint8 normal_channels;
   gchar *normal_sink_name;
+  gboolean normal_sink_name_provided;
   gchar *incall_sink_property;
   gint normal_volume_num_steps;
   gint incall_volume_num_steps;
@@ -103,7 +107,7 @@ struct _SoundsStatusMenuItemClass
 
 #if !GLIB_CHECK_VERSION(2, 38, 0)
 HD_DEFINE_PLUGIN_MODULE(
-    SoundsStatusMenuItem, sounds_status_menu_item, HD_TYPE_STATUS_MENU_ITEM)
+  SoundsStatusMenuItem, sounds_status_menu_item, HD_TYPE_STATUS_MENU_ITEM)
 #else
 HD_DEFINE_PLUGIN_MODULE_EXTENDED(SoundsStatusMenuItem,
                                  sounds_status_menu_item,
@@ -112,15 +116,21 @@ HD_DEFINE_PLUGIN_MODULE_EXTENDED(SoundsStatusMenuItem,
                                  , , )
 #endif
 
-static void reconnect(SoundsStatusMenuItem *menu_item);
-static void prop_sink_info_cb(pa_context *c, const pa_sink_info *i, int eol,
-                              void *userdata);
-static void set_volume(SoundsStatusMenuItem *menu_item, int volume);
+static void
+reconnect(SoundsStatusMenuItem *menu_item);
+static void
+prop_sink_info_cb(pa_context *c, const pa_sink_info *i, int eol,
+                  void *userdata);
+static void
+context_get_server_info_cb(pa_context *c,
+                           const pa_server_info *i,
+                           void *userdata);
+static void
+set_volume(SoundsStatusMenuItem *menu_item, int volume);
 
 static void
 sounds_status_menu_item_class_finalize(SoundsStatusMenuItemClass *klass)
-{
-}
+{}
 
 static void
 grab_keys(SoundsStatusMenuItemPrivate *priv)
@@ -152,11 +162,11 @@ hildon_window_get_active_window()
   int format;
   Atom type;
 
-  if (XGetWindowProperty(GDK_DISPLAY(), GDK_ROOT_WINDOW(), atom, 0,
-                         sizeof(Window), False, XA_WINDOW, &type, &format,
-                         &n_items, &bytes_after,
-                         (unsigned char **)&val) == Success &&
-      type == XA_WINDOW && format == 32 && n_items == 1 && val)
+  if ((XGetWindowProperty(GDK_DISPLAY(), GDK_ROOT_WINDOW(), atom, 0,
+                          sizeof(Window), False, XA_WINDOW, &type, &format,
+                          &n_items, &bytes_after,
+                          (unsigned char **)&val) == Success) &&
+      (type == XA_WINDOW) && (format == 32) && (n_items == 1) && val)
   {
     Window rv = *val;
     XFree(val);
@@ -210,7 +220,7 @@ grab_zoom(SoundsStatusMenuItem *menu_item)
     Atom type;
 
     XGetWindowProperty(GDK_DISPLAY(), window, atom, 0, 1, False, XA_INTEGER,
-                       &type, &format,&n_items, &bytes_after,
+                       &type, &format, &n_items, &bytes_after,
                        (unsigned char **)&val);
 
     if (val && *val && !priv->parent_window_mapped)
@@ -229,7 +239,6 @@ grab_zoom(SoundsStatusMenuItem *menu_item)
   return FALSE;
 }
 
-
 static double
 pa_vol_to_slider(int vol, int *steps, signed int steps_size)
 {
@@ -241,10 +250,10 @@ pa_vol_to_slider(int vol, int *steps, signed int steps_size)
   g_assert(steps);
   g_assert(steps_size > 1);
 
-  if ( *steps >= vol )
+  if (*steps >= vol)
     return 0.0;
 
-  if ( vol >= steps[steps_size - 1] )
+  if (vol >= steps[steps_size - 1])
     return 1.0;
 
   for (i = 0; i < steps_size; i++)
@@ -366,13 +375,14 @@ dbus_filter(DBusConnection *connection, DBusMessage *message, void *user_data)
                               DBUS_TYPE_INVALID))
     {
       if (priv->keys_are_grabbed &&
-        !priv->volume_changed &&
-        (hw_keycode == HW_KEYCODE_UP || hw_keycode == HW_KEYCODE_DOWN) &&
-        value)
+          !priv->volume_changed &&
+          ((hw_keycode == HW_KEYCODE_UP) || (hw_keycode == HW_KEYCODE_DOWN)) &&
+          value)
       {
         pa_operation *o;
 
-        priv->mm_key = (hw_keycode == HW_KEYCODE_UP ? X_KEYCODE_UP : X_KEYCODE_DOWN);
+        priv->mm_key =
+          (hw_keycode == HW_KEYCODE_UP ? X_KEYCODE_UP : X_KEYCODE_DOWN);
         o = pa_context_get_sink_info_by_name(priv->pa_context,
                                              priv->normal_sink_name,
                                              prop_sink_info_cb,
@@ -458,6 +468,7 @@ sounds_status_menu_item_dispose(GObject *object)
 
   dbus_connection_remove_filter(dbus_g_connection_get_connection(priv->dbus),
                                 dbus_filter, menu_item);
+
   if (priv->pa_operation)
   {
     pa_operation_unref(priv->pa_operation);
@@ -494,30 +505,35 @@ get_sinks(SoundsStatusMenuItemPrivate *priv)
   GKeyFile *key_file = g_key_file_new();
   GError *error = NULL;
 
-  if (g_key_file_load_from_file(key_file, CONFIGURATION_FILE, G_KEY_FILE_NONE, NULL) )
+  if (g_key_file_load_from_file(key_file, CONFIGURATION_FILE, G_KEY_FILE_NONE,
+                                NULL))
   {
     priv->normal_sink_name =
-        g_key_file_get_string(key_file, "normal", "sink_name", &error);
+      g_key_file_get_string(key_file, "normal", "sink_name", &error);
+
+    priv->normal_sink_name_provided = error ? FALSE : TRUE;
 
     if (error)
     {
-      g_warning("VOLUME: unable to get normal->sink_name [%s]", error->message);
       g_error_free(error);
       error = NULL;
     }
 
     priv->incall_sink_property =
-        g_key_file_get_string(key_file, "incall", "sink_property", &error);
+      g_key_file_get_string(key_file, "incall", "sink_property", &error);
 
     if (error)
     {
-      g_warning("VOLUME: unable to get incall->sink_property [%s]", error->message);
+      g_warning("VOLUME: unable to get incall->sink_property [%s]",
+                error->message);
       g_error_free(error);
       error = NULL;
     }
 
-    priv->swap_on_rotate = g_key_file_get_boolean(key_file, "behavior", "swap_on_rotate", NULL);
-    priv->native_landscape = g_key_file_get_boolean(key_file, "behavior", "native_is_landscape", NULL);
+    priv->swap_on_rotate =
+      g_key_file_get_boolean(key_file, "behavior", "swap_on_rotate", NULL);
+    priv->native_landscape =
+      g_key_file_get_boolean(key_file, "behavior", "native_is_landscape", NULL);
   }
 
   g_key_file_free(key_file);
@@ -529,7 +545,7 @@ create_volume_steps(SoundsStatusMenuItemPrivate *priv)
   gint i, n;
 
   n = priv->normal_volume_num_steps = 20;
-  priv->normal_volume_steps =  g_new(gint, n);
+  priv->normal_volume_steps = g_new(gint, n);
 
   for (i = 0; i < n; i++)
     priv->normal_volume_steps[i] = (i * 65536.0f) / n;
@@ -547,7 +563,7 @@ screen_size_changed_cb(GdkScreen *screen, gpointer user_data)
   SoundsStatusMenuItem *menu_item = SOUND_STATUS_MENU_ITEM(user_data);
 
   SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item)->portrait =
-      gdk_screen_get_height(screen) > gdk_screen_get_width(screen);
+    gdk_screen_get_height(screen) > gdk_screen_get_width(screen);
 }
 
 static gboolean
@@ -560,7 +576,7 @@ is_running(SoundsStatusMenuItem *menu_item)
   priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
 
   if (priv->pa_operation &&
-      pa_operation_get_state(priv->pa_operation) == PA_OPERATION_RUNNING)
+      (pa_operation_get_state(priv->pa_operation) == PA_OPERATION_RUNNING))
   {
     return TRUE;
   }
@@ -619,7 +635,7 @@ static void
 pa_ext_stream_restore_subscribe_cb(pa_context *c, void *userdata)
 {
   pa_operation *o =
-      pa_ext_stream_restore_read(c, ext_stream_restore_read_cb, userdata);
+    pa_ext_stream_restore_read(c, ext_stream_restore_read_cb, userdata);
 
   if (o)
     pa_operation_unref(o);
@@ -658,7 +674,7 @@ context_subscribe_cb(pa_context *c, pa_subscription_event_type_t t,
   SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
   pa_operation *o;
 
-  if (t == PA_SUBSCRIPTION_EVENT_CHANGE || t == PA_SUBSCRIPTION_EVENT_SINK)
+  if ((t == PA_SUBSCRIPTION_EVENT_CHANGE) || (t == PA_SUBSCRIPTION_EVENT_SINK))
   {
     o = pa_context_get_sink_info_by_name(c, priv->normal_sink_name,
                                          prop_sink_info_cb, menu_item);
@@ -666,17 +682,66 @@ context_subscribe_cb(pa_context *c, pa_subscription_event_type_t t,
   }
 }
 
-static void pa_subscribe_events(pa_context *c)
+static void
+pa_subscribe_events(pa_context *c)
 {
   pa_operation *o;
+
   o = pa_context_subscribe(c,
                            PA_SUBSCRIPTION_MASK_SINK|
                            PA_SUBSCRIPTION_MASK_SOURCE|
                            PA_SUBSCRIPTION_MASK_SERVER,
                            NULL,
                            NULL);
-   if (o)
-     pa_operation_unref(o);
+
+  if (o)
+    pa_operation_unref(o);
+}
+
+static gboolean
+get_normal_sink_info(SoundsStatusMenuItem *menu_item,
+                     SoundsStatusMenuItemPrivate *priv)
+{
+  pa_operation *o;
+
+  o = pa_context_get_sink_info_by_name(priv->pa_context, priv->normal_sink_name,
+                                       prop_sink_info_cb, menu_item);
+
+  if (o)
+  {
+    pa_operation_unref(o);
+    return TRUE;
+  }
+
+  g_warning("VOLUME: Pulse audio failure: %s %s",
+            pa_strerror(pa_context_errno(priv->pa_context)),
+            priv->normal_sink_name);
+
+  return FALSE;
+}
+
+static void
+context_get_server_info_cb(pa_context *c, const pa_server_info *i,
+                           void *userdata)
+{
+  SoundsStatusMenuItem *menu_item = userdata;
+  SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
+
+  if (!i)
+  {
+    g_warning("VOLUME: unable to get server info / default sink name: %s",
+              pa_strerror(pa_context_errno(c)));
+    return;
+  }
+
+  if (priv->normal_sink_name)
+  {
+    g_free(priv->normal_sink_name);
+    priv->normal_sink_name = NULL;
+  }
+
+  priv->normal_sink_name = g_strdup(i->default_sink_name);
+  get_normal_sink_info(menu_item, priv);
 }
 
 static void
@@ -691,8 +756,8 @@ context_state_callback(pa_context *c, void *userdata)
 
   state = pa_context_get_state(c);
 
-  if (state == PA_CONTEXT_READY || state == PA_CONTEXT_FAILED ||
-      state == PA_CONTEXT_TERMINATED)
+  if ((state == PA_CONTEXT_READY) || (state == PA_CONTEXT_FAILED) ||
+      (state == PA_CONTEXT_TERMINATED))
   {
     if (state == PA_CONTEXT_READY)
     {
@@ -710,13 +775,25 @@ context_state_callback(pa_context *c, void *userdata)
       pa_context_set_subscribe_callback(c, context_subscribe_cb, menu_item);
       pa_subscribe_events(c);
 
-      o = pa_context_get_sink_info_by_name(priv->pa_context, priv->normal_sink_name,
-                                       prop_sink_info_cb, menu_item);
-      if (o)
-        pa_operation_unref(o);
-      else
-        g_warning("VOLUME: Pulse audio failure: %s %s",
-                  pa_strerror(pa_context_errno(priv->pa_context)), priv->normal_sink_name);
+      if (priv->normal_sink_name_provided)
+      {
+        if (!get_normal_sink_info(menu_item, priv))
+          priv->normal_sink_name_provided = FALSE;
+      }
+
+      if (!priv->normal_sink_name_provided)
+      {
+        o = pa_context_get_server_info(priv->pa_context,
+                                       context_get_server_info_cb, menu_item);
+
+        if (o)
+          pa_operation_unref(o);
+        else
+        {
+          g_warning("VOLUME: Failed to create get_server_info operation: %s",
+                    pa_strerror(pa_context_errno(priv->pa_context)));
+        }
+      }
     }
     else
       reconnect(menu_item);
@@ -907,18 +984,17 @@ expose_event_cb(GtkWidget *widget, GdkEvent *event, gpointer user_data)
 
   icon_name = get_icon_name(volume * 100.0, 1);
   priv->icon = gtk_icon_theme_load_icon(
-        gtk_icon_theme_get_default(), icon_name,
-        hildon_get_icon_pixel_size(HILDON_ICON_SIZE_FINGER), 0, 0);
+      gtk_icon_theme_get_default(), icon_name,
+      hildon_get_icon_pixel_size(HILDON_ICON_SIZE_FINGER), 0, 0);
 
   if (priv->icon)
   {
     gdk_cairo_set_source_pixbuf(
-          cr, priv->icon, x,
-          (widget->allocation.y + (widget->allocation.height -
-                                   gdk_pixbuf_get_height(priv->icon)) / 2));
+      cr, priv->icon, x,
+      (widget->allocation.y + (widget->allocation.height -
+                               gdk_pixbuf_get_height(priv->icon)) / 2));
     cairo_paint(cr);
   }
-
 
   draw_volume_bar(cr, x + 53, 30.0, volume * 322.0, 18.0, 2, volume > 0.99);
   cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 1.0);
@@ -946,7 +1022,7 @@ parse_tuning_property(const gchar *property, gint *num_steps_out,
   gint *steps;
   GQuark q = g_quark_from_string(property);
 
-  if (q == *quark )
+  if (q == *quark)
     return FALSE;
 
   *quark = q;
@@ -965,12 +1041,12 @@ parse_tuning_property(const gchar *property, gint *num_steps_out,
     gchar **step_array = g_strsplit(steps_array[i], ":", -1);
     int vol;
 
-    if (g_strv_length(step_array) != 2 || !step_array[1] || !*step_array[1])
+    if ((g_strv_length(step_array) != 2) || !step_array[1] || !*step_array[1])
       continue;
 
     vol = strtol(step_array[1], NULL, 10);
 
-    if (i == 0 && vol <= -6000)
+    if ((i == 0) && (vol <= -6000))
     {
       g_strfreev(step_array);
       continue;
@@ -989,11 +1065,14 @@ parse_tuning_property(const gchar *property, gint *num_steps_out,
   return TRUE;
 }
 
-static
-void error_callback(pa_context *c, int success, void *userdata)
+static void
+error_callback(pa_context *c, int success, void *userdata)
 {
-    if (!success) 
-        g_warning("VOLUME: Pulse audio failure: %s", pa_strerror(pa_context_errno(c)));
+  if (!success)
+  {
+    g_warning("VOLUME: Pulse audio failure: %s",
+              pa_strerror(pa_context_errno(c)));
+  }
 }
 
 static void
@@ -1008,18 +1087,21 @@ prop_sink_info_cb(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
   gint *steps;
   double current_vol;
   double new_vol;
-  
+
   g_assert((priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item)));
-  
-  if (i && priv->normal_channels == 0 && g_str_equal(priv->normal_sink_name, i->name))
+
+  if (i && (priv->normal_channels == 0) &&
+      g_str_equal(priv->normal_sink_name, i->name))
+  {
     priv->normal_channels = i->channel_map.channels;
+  }
 
   if (eol)
     return;
 
   prop_incall = pa_proplist_gets(i->proplist, priv->incall_sink_property);
 
-  parse_tuning_property(prop_incall,&priv->incall_volume_num_steps,
+  parse_tuning_property(prop_incall, &priv->incall_volume_num_steps,
                         &priv->incall_volume_steps, &priv->quark_incall);
 
   if (priv->call_active)
@@ -1030,9 +1112,10 @@ prop_sink_info_cb(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
   }
   else
   {
-    if(!i->volume.channels)
+    if (!i->volume.channels)
     {
-      g_warning("VOLUME: %s: can't set volume from sink with zero channels", __func__);
+      g_warning("VOLUME: %s: can't set volume from sink with zero channels",
+                __func__);
       return;
     }
 
@@ -1040,13 +1123,14 @@ prop_sink_info_cb(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
     steps = priv->normal_volume_steps;
     steps_size = priv->normal_volume_num_steps;
     priv->normal_volume = volume;
-    g_debug("VOLUME: %s: normal volume is now %i", __func__, priv->normal_volume);
+    g_debug("VOLUME: %s: normal volume is now %i", __func__,
+            priv->normal_volume);
   }
 
   current_vol = pa_vol_to_slider(volume, steps, steps_size);
-  
+
   if ((!priv->portrait && priv->swap_on_rotate && priv->display_on) ||
-    (!priv->display_on && priv->native_landscape))
+      (!priv->display_on && priv->native_landscape))
   {
     if (priv->mm_key == X_KEYCODE_UP)
       priv->mm_key = X_KEYCODE_DOWN;
@@ -1071,7 +1155,8 @@ prop_sink_info_cb(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
     priv->volume_changed = TRUE;
     g_timeout_add(50, reset_volume_changed, menu_item);
 
-    if (!priv->parent_window_mapped && !hildon_get_dnd(hildon_window_get_active_window()))
+    if (!priv->parent_window_mapped &&
+        !hildon_get_dnd(hildon_window_get_active_window()))
     {
       update_slider(menu_item);
 
@@ -1118,17 +1203,24 @@ set_volume(SoundsStatusMenuItem *menu_item, int volume)
     pa_cvolume cv;
     priv->normal_volume = volume;
     priv->normal_volume_set = TRUE;
+
     for (guint8 i = 0; i < priv->normal_channels; ++i)
       cv.values[i] = volume;
+
     cv.channels = priv->normal_channels;
     pa_operation *o;
 
-    o = pa_context_set_sink_volume_by_name(priv->pa_context, priv->normal_sink_name, &cv, error_callback, NULL);
+    o = pa_context_set_sink_volume_by_name(
+        priv->pa_context, priv->normal_sink_name, &cv, error_callback, NULL);
+
     if (o)
       pa_operation_unref(o);
-    else 
+    else
+    {
       g_warning("VOLUME: Pulse audio failure: %s %s",
-                pa_strerror(pa_context_errno(priv->pa_context)), priv->normal_sink_name);
+                pa_strerror(pa_context_errno(priv->pa_context)),
+                priv->normal_sink_name);
+    }
   }
 }
 
@@ -1199,11 +1291,11 @@ parent_set_cb(GtkWidget *widget, GtkWidget *old_parent,
   {
     ancestor = gtk_widget_get_ancestor(GTK_WIDGET(old_parent), GTK_TYPE_WINDOW);
     g_signal_handlers_disconnect_matched(
-          G_OBJECT(ancestor), G_SIGNAL_MATCH_DATA | G_SIGNAL_MATCH_FUNC, 0, 0,
-          NULL, parent_window_map_cb, menu_item);
+      G_OBJECT(ancestor), G_SIGNAL_MATCH_DATA | G_SIGNAL_MATCH_FUNC, 0, 0,
+      NULL, parent_window_map_cb, menu_item);
     g_signal_handlers_disconnect_matched(
-          G_OBJECT(ancestor), G_SIGNAL_MATCH_DATA | G_SIGNAL_MATCH_FUNC, 0, 0,
-          NULL, parent_window_unmap_cb, menu_item);
+      G_OBJECT(ancestor), G_SIGNAL_MATCH_DATA | G_SIGNAL_MATCH_FUNC, 0, 0,
+      NULL, parent_window_unmap_cb, menu_item);
     priv->parent_signals_connected = FALSE;
   }
 
@@ -1225,7 +1317,7 @@ sounds_status_menu_item_init(SoundsStatusMenuItem *menu_item)
   SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
   pa_glib_mainloop *m;
   GtkWidget *hbox;
-  DBusConnection *conn ;
+  DBusConnection *conn;
   GError *error = NULL;
   GdkScreen *screen;
 
@@ -1252,13 +1344,13 @@ sounds_status_menu_item_init(SoundsStatusMenuItem *menu_item)
   gdk_window_set_events(GDK_ROOT_PARENT(),
                         gdk_window_get_events(GDK_ROOT_PARENT()) |
                         GDK_PROPERTY_CHANGE_MASK);
-  
+
   gdk_window_add_filter(0, gdk_filter_func, menu_item);
 
   screen = gdk_screen_get_default();
   priv->portrait = gdk_screen_get_height(screen) > gdk_screen_get_width(screen);
   priv->size_changed_id = g_signal_connect(
-        screen, "size-changed", G_CALLBACK(screen_size_changed_cb), menu_item);
+      screen, "size-changed", G_CALLBACK(screen_size_changed_cb), menu_item);
 
   m = pa_glib_mainloop_new(g_main_context_default());
   g_assert(m);
@@ -1286,9 +1378,9 @@ sounds_status_menu_item_init(SoundsStatusMenuItem *menu_item)
 
   priv->hscale = hildon_gtk_hscale_new();
   gtk_box_pack_start(GTK_BOX(hbox), priv->hscale, TRUE, TRUE, 8);
-  priv->hscale_value_changed_id  =
-      g_signal_connect(priv->hscale, "value-changed",
-                       G_CALLBACK(hscale_value_changed_cb), menu_item);
+  priv->hscale_value_changed_id =
+    g_signal_connect(priv->hscale, "value-changed",
+                     G_CALLBACK(hscale_value_changed_cb), menu_item);
 
   gtk_widget_show(priv->hscale);
   gtk_widget_show(priv->image);
