@@ -1,3 +1,9 @@
+maemo-statusmenu-volume (0.57) unstable; urgency=low
+
+  * Find default sink name upon connect
+
+ -- Ivaylo Dimitrov <ivo.g.dimitrov.75@gmail.com>  Sun, 05 Feb 2023 15:19:52 +0200
+
 maemo-statusmenu-volume (0.56) unstable; urgency=low
 
   * Implement external volume events
