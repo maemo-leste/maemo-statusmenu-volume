@@ -128,6 +128,9 @@ context_get_server_info_cb(pa_context *c,
                            void *userdata);
 static void
 set_volume(SoundsStatusMenuItem *menu_item, int volume);
+static gboolean
+get_normal_sink_info(SoundsStatusMenuItem *menu_item,
+                      SoundsStatusMenuItemPrivate *priv);
 
 static void
 sounds_status_menu_item_class_finalize(SoundsStatusMenuItemClass *klass)
@@ -689,18 +692,56 @@ ext_stream_restore_test_cb(pa_context *c, uint32_t version, void *userdata)
 }
 
 static void
+follow_default_sink(SoundsStatusMenuItem *menu_item)
+{
+  SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
+  pa_operation *o;
+
+  /* A sink explicitly named in sinks.ini wins and is never replaced by the
+   * server default. */
+  if (priv->normal_sink_name_provided)
+    return;
+
+  o = pa_context_get_server_info(priv->pa_context,
+                                  context_get_server_info_cb, menu_item);
+
+  if (o)
+    pa_operation_unref(o);
+  else
+    g_warning("VOLUME: failed to create get_server_info operation: %s",
+              pa_strerror(pa_context_errno(priv->pa_context)));
+}
+
+static void
 context_subscribe_cb(pa_context *c, pa_subscription_event_type_t t,
                      uint32_t idx, void *userdata)
 {
   SoundsStatusMenuItem *menu_item = userdata;
   SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
-  pa_operation *o;
+  pa_subscription_event_type_t facility =
+    t & PA_SUBSCRIPTION_EVENT_FACILITY_MASK;
+  pa_subscription_event_type_t type = t & PA_SUBSCRIPTION_EVENT_TYPE_MASK;
 
-  if ((t == PA_SUBSCRIPTION_EVENT_CHANGE) || (t == PA_SUBSCRIPTION_EVENT_SINK))
+  /* t is a combination of a facility and an event type, so it has to be
+   * masked before comparing. The previous "t == PA_SUBSCRIPTION_EVENT_CHANGE"
+   * style only ever matched SINK|CHANGE, and "t == PA_SUBSCRIPTION_EVENT_SINK"
+   * only matched SINK|NEW (both constants are 0), so sink removals and
+   * default-sink switches were invisible. */
+  switch (facility)
   {
-    o = pa_context_get_sink_info_by_name(c, priv->normal_sink_name,
-                                         prop_sink_info_cb, menu_item);
-    pa_operation_unref(o);
+    case PA_SUBSCRIPTION_EVENT_SINK:
+      if (type == PA_SUBSCRIPTION_EVENT_REMOVE)
+        follow_default_sink(menu_item);
+      else
+        get_normal_sink_info(menu_item, priv);
+      break;
+
+    case PA_SUBSCRIPTION_EVENT_SERVER:
+      follow_default_sink(menu_item);
+      break;
+
+    default:
+      break;
   }
 }
 
