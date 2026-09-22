@@ -22,29 +22,23 @@
 
 #define CONFIGURATION_FILE "/usr/share/maemo-statusmenu-volume/sinks.ini"
 
-/* Fallback tuning ladders, used when the sink publishes no tuning property.
+/* Fallback tuning tables, used when the sink publishes no tuning property.
  *
- * They are written in the very same "alsa_value:dB_centibel" format as
- * x-maemo.alsa_sink.mixer_tuning so they go through parse_tuning_property()
- * like any real one - there is exactly one representation of a volume table
- * in this file. The leading -6000 entry is dropped by the parser's floor
- * skip, which leaves 20 steps for media and 10 for in-call.
- *
- * Values are the N900 internal-speaker ladders from community-ssu/
+ * Format: comma separated gain values in centibel, ascending. The values
+ * below are the N900 internal-speaker ladders from community-ssu/
  * pulseaudio-nokia, src/common/data/ihf.parameters (mixer_tuning and
- * alt_mixer_tuning), minus the "HP DAC=" mixer-name prefix that the parser
- * strips anyway. They are a sane generic default, not a claim about the
- * hardware in hand: the real per-device curves should be published by the
- * audio stack (a wireplumber monitor.alsa.rules drop-in in maemo-audio),
- * which overrides these. */
+ * alt_mixer_tuning), which gives 20 steps for media and 10 for in-call.
+ *
+ * They are a sane generic default, not a claim about the hardware in hand.
+ * The real per-device curves should be published by the audio stack (a
+ * wireplumber monitor.alsa.rules drop-in in maemo-audio), which overrides
+ * these. */
 #define DEFAULT_NORMAL_TUNING \
-  "0:-6000,38:-4000,42:-3800,46:-3600,50:-3400,54:-3200,58:-3000," \
-  "62:-2800,66:-2600,70:-2400,74:-2200,78:-2000,86:-1600,90:-1400," \
-  "94:-1200,98:-1000,102:-800,106:-600,110:-400,114:-200,118:0"
+  "-4000,-3800,-3600,-3400,-3200,-3000,-2800,-2600,-2400,-2200," \
+  "-2000,-1600,-1400,-1200,-1000,-800,-600,-400,-200,0"
 
 #define DEFAULT_INCALL_TUNING \
-  "0:-6000,78:-2000,86:-1600,90:-1400,94:-1200,98:-1000,102:-800," \
-  "106:-600,110:-400,114:-200,118:0"
+  "-2000,-1600,-1400,-1200,-1000,-800,-600,-400,-200,0"
 
 #define SOUND_STATUS_MENU_TYPE_ITEM (sounds_status_menu_item_get_type())
 #define SOUND_STATUS_MENU_ITEM(obj) \
@@ -1102,51 +1096,82 @@ static gboolean
 parse_tuning_property(const gchar *property, gint *num_steps_out,
                       gint **steps_out, GQuark *quark)
 {
-  const gchar *p;
   gchar **steps_array;
   gint i, l;
   gint num_steps = 1;
   gint *steps;
-  GQuark q = g_quark_from_string(property);
+  GQuark q;
 
-  /* No property at all: keep whatever table we already have. Without this
-   * a sink that lacks the property would reach strchr(NULL, '=') below and
-   * segfault as soon as a previous sink had set *quark. */
+  /* No property at all: keep whatever table we already have. */
   if (!property)
     return FALSE;
+
+  q = g_quark_from_string(property);
 
   if (q == *quark)
     return FALSE;
 
   *quark = q;
-  p = strchr(property, '=');
 
-  if (!p)
-    p = property;
-
-  steps_array = g_strsplit(p, ",", -1);
+  /* Format: a comma separated list of gain values in centibel, ascending,
+   * for example "-4000,-3800,...,-200,0". Index 0 of the table built here
+   * is always silence; the listed values are the real volume steps.
+   *
+   * This is deliberately not the Nokia "alsa_value:dB" form. The leading
+   * ALSA control value was only ever consumed by module-alsa-sink-volume,
+   * which does not exist on Leste; with UCM the audio stack programs the
+   * hardware itself, so carrying that column would only invite people to
+   * invent plausible numbers for a field nothing reads. */
+  steps_array = g_strsplit(property, ",", -1);
   l = g_strv_length(steps_array);
-  steps = g_new(gint, l + 2);
+  steps = g_new(gint, l + 1);
   steps[0] = 0;
 
   for (i = 0; i < l; i++)
   {
-    gchar **step_array = g_strsplit(steps_array[i], ":", -1);
-    int vol;
+    const gchar *entry = steps_array[i];
+    gchar *end = NULL;
+    long centibel;
+    gint linear;
 
-    if ((g_strv_length(step_array) != 2) || !step_array[1] || !*step_array[1])
+    if (!entry || !*entry)
       continue;
 
-    vol = strtol(step_array[1], NULL, 10);
+    centibel = strtol(entry, &end, 10);
 
-    if ((i == 0) && (vol <= -6000))
+    if (end == entry)
     {
-      g_strfreev(step_array);
+      g_warning("VOLUME: ignoring tuning step '%s', not a number", entry);
       continue;
     }
 
-    steps[num_steps++] = pa_sw_volume_from_dB(vol / 100.0);
-    g_strfreev(step_array);
+    /* strtol() stops at the first character it cannot read, so without this
+     * a leftover "alsa_value:dB" table would parse as 1 cB, 31 cB, 118 cB -
+     * a nearly-silent table instead of a rejected one. Nothing may follow
+     * the number but whitespace. */
+    while (*end == ' ' || *end == '\t')
+      end++;
+
+    if (*end != '\0')
+    {
+      g_warning("VOLUME: ignoring tuning step '%s', trailing garbage after "
+                "the value (expected a plain centibel number)", entry);
+      continue;
+    }
+
+    linear = (gint) pa_sw_volume_from_dB(centibel / 100.0);
+
+    /* Both mapping functions interpolate between neighbouring entries and
+     * divide by their difference, so an entry that is not strictly above
+     * the previous one would divide by zero or map backwards. */
+    if (num_steps > 1 && linear <= steps[num_steps - 1])
+    {
+      g_warning("VOLUME: tuning step %ld cB does not exceed the previous "
+                "one, ignoring it (the table must be ascending)", centibel);
+      continue;
+    }
+
+    steps[num_steps++] = linear;
   }
 
   g_strfreev(steps_array);
