@@ -1,0 +1,191 @@
+===== snapshot: 30-vc-earpiece  at 2026-09-22T20:11:30+03:00 =====
+
+-- defaults --
+Default Sink: alsa_output.platform-soundcard.Voice_Call__Earpiece__sink
+Default Source: alsa_output.platform-soundcard.Voice_Call__Earpiece__sink.monitor
+
+-- cards: name / active profile --
+Card #48
+	Name: alsa_card.platform-omap-hdmi-audio.3.auto
+	Profiles:
+	Active Profile: off
+Card #49
+	Name: alsa_card.platform-soundcard
+	Profiles:
+	Active Profile: Voice Call (Earpiece)
+
+-- sinks: name / state / port / volume / mute --
+Sink #1688
+	State: SUSPENDED
+	Name: alsa_output.platform-soundcard.Voice_Call__Earpiece__sink
+	Description: Built-in Audio Internal Earpiece
+	Mute: no
+	Volume: front-left: 26214 /  40% / -23.88 dB,   front-right: 26214 /  40% / -23.88 dB
+	Base Volume: 50097 /  76% / -7.00 dB
+	Active Port: [Out] Earpiece
+
+-- sources: name / state / port --
+Source #1688
+	State: SUSPENDED
+	Name: alsa_output.platform-soundcard.Voice_Call__Earpiece__sink.monitor
+	Mute: no
+	Active Port: [Out] Earpiece
+
+-- card profiles + ports (what UCM reports) --
+(pactl rejects '-v' for cards/sinks/sources; extract the blocks directly)
+
+Card #48
+	Profiles:
+		off: Off (sinks: 0, sources: 0, priority: 0, available: yes)
+		HiFi: HDMI Audio (sinks: 1, sources: 0, priority: 8300, available: no)
+		pro-audio: Pro Audio (sinks: 1, sources: 0, priority: 1, available: yes)
+	Active Profile: off
+	Ports:
+		[Out] HDMI: HDMI Output (type: HDMI, priority: 300, latency offset: 0 usec, availability group: HDMI, not available)
+			Properties:
+				port.type = "hdmi"
+				port.availability-group = "HDMI"
+				device.icon_name = "video-display"
+				card.profile.port = "0"
+			Part of profile(s): HiFi
+
+
+Card #49
+	Profiles:
+		off: Off (sinks: 0, sources: 0, priority: 0, available: yes)
+		HiFi (Headphones, Headset): Play HiFi quality music (Headphones, Headset) (sinks: 1, sources: 1, priority: 8500, available: no)
+		HiFi (Headphones, Mic): Play HiFi quality music (Headphones, Mic) (sinks: 1, sources: 1, priority: 8400, available: no)
+		HiFi (Headset, Speaker): Play HiFi quality music (Headset, Speaker) (sinks: 1, sources: 1, priority: 8300, available: no)
+		HiFi (Mic, Speaker): Play HiFi quality music (Mic, Speaker) (sinks: 1, sources: 1, priority: 8200, available: yes)
+		Voice Call (Headphones): Make a phone call (Headphones) (sinks: 1, sources: 0, priority: 4200, available: no)
+		Voice Call (Speaker): Make a phone call (Speaker) (sinks: 1, sources: 0, priority: 4200, available: yes)
+		Voice Call (Earpiece): Make a phone call (Earpiece) (sinks: 1, sources: 0, priority: 4200, available: yes)
+		pro-audio: Pro Audio (sinks: 2, sources: 1, priority: 1, available: yes)
+	Active Profile: Voice Call (Earpiece)
+	Ports:
+		[Out] Headphones: Headset (type: Headphones, priority: 300, latency offset: 0 usec, availability group: Headphones, not available)
+			Properties:
+				port.type = "headphones"
+				port.availability-group = "Headphones"
+				device.icon_name = "audio-headphones"
+				card.profile.port = "0"
+			Part of profile(s): Voice Call (Headphones), HiFi (Headphones, Headset), HiFi (Headphones, Mic)
+		[Out] Speaker: Internal speaker (type: Speaker, priority: 100, latency offset: 0 usec, availability unknown)
+			Properties:
+				port.type = "speaker"
+				device.icon_name = "audio-speakers"
+				card.profile.port = "1"
+			Part of profile(s): Voice Call (Speaker), HiFi (Headset, Speaker), HiFi (Mic, Speaker)
+		[Out] Earpiece: Internal Earpiece (type: Earpiece, priority: 200, latency offset: 0 usec, availability unknown)
+			Properties:
+				port.type = "earpiece"
+				device.icon_name = "audio-speakers"
+				card.profile.port = "2"
+			Part of profile(s): Voice Call (Earpiece)
+		[In] Headset: Headset Microphone (type: Headset, priority: 200, latency offset: 0 usec, availability group: Headphones, not available)
+			Properties:
+				port.type = "headset"
+				port.availability-group = "Headphones"
+				device.icon_name = "audio-headset"
+				card.profile.port = "3"
+			Part of profile(s): HiFi (Headphones, Headset), HiFi (Headset, Speaker)
+		[In] Mic: Internal Microphone (type: Mic, priority: 100, latency offset: 0 usec, availability unknown)
+			Properties:
+				port.type = "mic"
+				device.icon_name = "audio-input-microphone"
+				card.profile.port = "4"
+			Part of profile(s): HiFi (Headphones, Mic), HiFi (Mic, Speaker)
+
+-- node names + ports (PipeWire view) --
+  [Audio/Device] id=48
+      media.class = Audio/Device
+      device.name = alsa_card.platform-omap-hdmi-audio.3.auto
+      device.description = Built-in Audio
+      device.form-factor = internal
+      device.api = alsa
+      params.Profile: [{"index": 0, "name": "off", "description": "Off", "priority": 0, "available": "yes", "classes": [0], "save": false}]
+  [Audio/Device] id=49
+      media.class = Audio/Device
+      device.name = alsa_card.platform-soundcard
+      device.description = Built-in Audio
+      device.form-factor = internal
+      device.api = alsa
+      params.Profile: [{"index": 7, "name": "Voice Call (Earpiece)", "description": "Make a phone call (Earpiece)", "priority": 4200, "available": "yes", "classes": [1, ["Audio/Sink", 1, "card.profile.devices", [2]]], "save": true}]
+  [Audio/Sink] id=57
+      node.name = alsa_output.platform-soundcard.Voice_Call__Earpiece__sink
+      node.description = Built-in Audio Internal Earpiece
+      media.class = Audio/Sink
+      device.api = alsa
+  (3 audio nodes matched)
+
+-- jack sysfs state --
+
+-- amixer: gain / jack / switch controls with dB ranges --
+  --- card0 ---
+    numid=1,iface=CARD,name='HDMI Jack'
+      ; type=BOOLEAN,access=r-------,values=1
+      : values=off
+  --- card1 ---
+    numid=1,iface=CARD,name='Headphones Jack'
+      ; type=BOOLEAN,access=r-------,values=1
+      : values=off
+    numid=25,iface=MIXER,name='Lineout Left Playback Route'
+    --
+    numid=5,iface=MIXER,name='Mic1 Capture Volume'
+      ; type=INTEGER,access=rw---R--,values=1,min=0,max=31,step=0
+      : values=15
+      | dBscale-min=0.00dB,step=1.00dB,mute=0
+    numid=6,iface=MIXER,name='Mic2 Capture Volume'
+      ; type=INTEGER,access=rw---R--,values=1,min=0,max=31,step=0
+      : values=15
+      | dBscale-min=0.00dB,step=1.00dB,mute=0
+    --
+    numid=10,iface=MIXER,name='Call Volume'
+      ; type=INTEGER,access=rw---R--,values=1,min=0,max=7,step=0
+      : values=0
+      | dBscale-min=0.00dB,step=1.00dB,mute=0
+    --
+    numid=17,iface=MIXER,name='Ext Left Enable Switch'
+      ; type=BOOLEAN,access=rw------,values=1
+      : values=off
+    numid=8,iface=MIXER,name='Ext Left Phase Invert Switch'
+      ; type=BOOLEAN,access=rw------,values=1
+      : values=off
+    numid=20,iface=MIXER,name='Ext Mono Playback Switch'
+      ; type=BOOLEAN,access=rw------,values=1
+      : values=off
+    numid=4,iface=MIXER,name='Ext Playback Volume'
+      ; type=INTEGER,access=rw---R--,values=1,min=0,max=15,step=0
+      : values=0
+      | dBscale-min=-33.00dB,step=3.00dB,mute=0
+    numid=16,iface=MIXER,name='Ext Right Enable Switch'
+      ; type=BOOLEAN,access=rw------,values=1
+      : values=off
+    numid=27,iface=MIXER,name='Headset Left Playback Route'
+    --
+    numid=19,iface=MIXER,name='HiFi Mono Playback Switch'
+      ; type=BOOLEAN,access=rw------,values=1
+      : values=off
+    numid=2,iface=MIXER,name='HiFi Playback Volume'
+      ; type=INTEGER,access=rw---R--,values=1,min=0,max=15,step=0
+      : values=15
+      | dBscale-min=-33.00dB,step=3.00dB,mute=0
+    numid=7,iface=MIXER,name='Hifi Left Phase Invert Switch'
+      ; type=BOOLEAN,access=rw------,values=1
+      : values=off
+    numid=15,iface=MIXER,name='Left Capture Route'
+    --
+    numid=18,iface=MIXER,name='Voice Loopback Switch'
+      ; type=BOOLEAN,access=rw------,values=1
+      : values=off
+    numid=3,iface=MIXER,name='Voice Playback Volume'
+      ; type=INTEGER,access=rw---R--,values=1,min=0,max=15,step=0
+      : values=9
+      | dBscale-min=-33.00dB,step=3.00dB,mute=0
+
+-- x-maemo tuning properties --
+  (nothing above = no tuning property published yet)
+
+-- active stream routing (if any) --
+
+===== end snapshot: 30-vc-earpiece =====
