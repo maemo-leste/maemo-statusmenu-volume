@@ -73,6 +73,7 @@ struct _SoundsStatusMenuItemPrivate
   guint8 normal_channels;
   gchar *normal_sink_name;
   gboolean normal_sink_name_provided;
+  gchar *normal_sink_property;
   gchar *incall_sink_property;
   gint normal_volume_num_steps;
   gint incall_volume_num_steps;
@@ -525,6 +526,17 @@ get_sinks(SoundsStatusMenuItemPrivate *priv)
 
     if (error)
     {
+      g_error_free(error);
+      error = NULL;
+    }
+
+    priv->normal_sink_property =
+      g_key_file_get_string(key_file, "normal", "sink_property", &error);
+
+    if (error)
+    {
+      g_warning("VOLUME: unable to get normal->sink_property [%s]",
+                error->message);
       g_error_free(error);
       error = NULL;
     }
@@ -1105,6 +1117,7 @@ prop_sink_info_cb(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
   SoundsStatusMenuItem *menu_item = userdata;
   SoundsStatusMenuItemPrivate *priv;
   gboolean volume_changed = FALSE;
+  const char *prop_normal;
   const char *prop_incall;
   gint volume;
   gint steps_size;
@@ -1122,6 +1135,13 @@ prop_sink_info_cb(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
 
   if (eol)
     return;
+
+  prop_normal = priv->normal_sink_property ?
+                  pa_proplist_gets(i->proplist, priv->normal_sink_property) :
+                  NULL;
+
+  parse_tuning_property(prop_normal, &priv->normal_volume_num_steps,
+                        &priv->normal_volume_steps, &priv->quark_normal);
 
   prop_incall = priv->incall_sink_property ?
                   pa_proplist_gets(i->proplist, priv->incall_sink_property) :
