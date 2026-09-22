@@ -61,6 +61,7 @@ struct _SoundsStatusMenuItemPrivate
   gulong hscale_value_changed_id;
   gchar *default_sink_name;
   pa_context *pa_context;
+  pa_glib_mainloop *pa_loop;
   int normal_volume;
   gboolean normal_volume_set;
   gboolean slider_changed;
@@ -463,10 +464,20 @@ sounds_status_menu_item_dispose(GObject *object)
     priv->pa_context = NULL;
   }
 
+  if (priv->pa_loop)
+  {
+    pa_glib_mainloop_free(priv->pa_loop);
+    priv->pa_loop = NULL;
+    priv->pa_api = NULL;
+  }
+
   g_signal_handler_disconnect(gdk_screen_get_default(), priv->size_changed_id);
 
-  dbus_connection_remove_filter(dbus_g_connection_get_connection(priv->dbus),
-                                dbus_filter, menu_item);
+  if (priv->dbus)
+  {
+    dbus_connection_remove_filter(dbus_g_connection_get_connection(priv->dbus),
+                                  dbus_filter, menu_item);
+  }
 
   if (priv->pa_operation)
   {
@@ -920,10 +931,10 @@ slider_volume_decrease_step(SoundsStatusMenuItem *menu_item, double volume)
     num_steps = priv->normal_volume_num_steps;
   }
 
-  pa_vol = slider_to_pa_vol(volume, steps, num_steps) - 1;
-
-  if (num_steps == 1)
+  if (num_steps < 2)
     return 0.0;
+
+  pa_vol = slider_to_pa_vol(volume, steps, num_steps) - 1;
 
   for (i = num_steps - 1; i; i--)
   {
@@ -1021,6 +1032,12 @@ parse_tuning_property(const gchar *property, gint *num_steps_out,
   gint *steps;
   GQuark q = g_quark_from_string(property);
 
+  /* No property at all: keep whatever table we already have. Without this
+   * a sink that lacks the property would reach strchr(NULL, '=') below and
+   * segfault as soon as a previous sink had set *quark. */
+  if (!property)
+    return FALSE;
+
   if (q == *quark)
     return FALSE;
 
@@ -1056,6 +1073,14 @@ parse_tuning_property(const gchar *property, gint *num_steps_out,
   }
 
   g_strfreev(steps_array);
+
+  /* A table with a single entry is useless and would trip the g_assert()
+   * in slider_to_pa_vol() / pa_vol_to_slider(). Keep the previous table. */
+  if (num_steps < 2)
+  {
+    g_free(steps);
+    return FALSE;
+  }
 
   *num_steps_out = num_steps;
   g_free(*steps_out);
@@ -1098,7 +1123,9 @@ prop_sink_info_cb(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
   if (eol)
     return;
 
-  prop_incall = pa_proplist_gets(i->proplist, priv->incall_sink_property);
+  prop_incall = priv->incall_sink_property ?
+                  pa_proplist_gets(i->proplist, priv->incall_sink_property) :
+                  NULL;
 
   parse_tuning_property(prop_incall, &priv->incall_volume_num_steps,
                         &priv->incall_volume_steps, &priv->quark_incall);
@@ -1354,6 +1381,7 @@ sounds_status_menu_item_init(SoundsStatusMenuItem *menu_item)
   m = pa_glib_mainloop_new(g_main_context_default());
   g_assert(m);
 
+  priv->pa_loop = m;
   priv->pa_api = pa_glib_mainloop_get_api(m);
   reconnect(menu_item);
 
