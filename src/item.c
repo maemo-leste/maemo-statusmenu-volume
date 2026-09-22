@@ -22,6 +22,30 @@
 
 #define CONFIGURATION_FILE "/usr/share/maemo-statusmenu-volume/sinks.ini"
 
+/* Fallback tuning ladders, used when the sink publishes no tuning property.
+ *
+ * They are written in the very same "alsa_value:dB_centibel" format as
+ * x-maemo.alsa_sink.mixer_tuning so they go through parse_tuning_property()
+ * like any real one - there is exactly one representation of a volume table
+ * in this file. The leading -6000 entry is dropped by the parser's floor
+ * skip, which leaves 20 steps for media and 10 for in-call.
+ *
+ * Values are the N900 internal-speaker ladders from community-ssu/
+ * pulseaudio-nokia, src/common/data/ihf.parameters (mixer_tuning and
+ * alt_mixer_tuning), minus the "HP DAC=" mixer-name prefix that the parser
+ * strips anyway. They are a sane generic default, not a claim about the
+ * hardware in hand: the real per-device curves should be published by the
+ * audio stack (a wireplumber monitor.alsa.rules drop-in in maemo-audio),
+ * which overrides these. */
+#define DEFAULT_NORMAL_TUNING \
+  "0:-6000,38:-4000,42:-3800,46:-3600,50:-3400,54:-3200,58:-3000," \
+  "62:-2800,66:-2600,70:-2400,74:-2200,78:-2000,86:-1600,90:-1400," \
+  "94:-1200,98:-1000,102:-800,106:-600,110:-400,114:-200,118:0"
+
+#define DEFAULT_INCALL_TUNING \
+  "0:-6000,78:-2000,86:-1600,90:-1400,94:-1200,98:-1000,102:-800," \
+  "106:-600,110:-400,114:-200,118:0"
+
 #define SOUND_STATUS_MENU_TYPE_ITEM (sounds_status_menu_item_get_type())
 #define SOUND_STATUS_MENU_ITEM(obj) \
   (G_TYPE_CHECK_INSTANCE_CAST((obj), \
@@ -81,6 +105,8 @@ struct _SoundsStatusMenuItemPrivate
   gint *incall_volume_steps;
   GQuark quark_normal;
   GQuark quark_incall;
+  gboolean warned_normal_tuning;
+  gboolean warned_incall_tuning;
   pa_mainloop_api *pa_api;
   pa_operation *pa_operation;
   gboolean parent_signals_connected;
@@ -131,6 +157,9 @@ set_volume(SoundsStatusMenuItem *menu_item, int volume);
 static gboolean
 get_normal_sink_info(SoundsStatusMenuItem *menu_item,
                       SoundsStatusMenuItemPrivate *priv);
+static gboolean
+parse_tuning_property(const gchar *property, gint *num_steps_out,
+                      gint **steps_out, GQuark *quark);
 
 static void
 sounds_status_menu_item_class_finalize(SoundsStatusMenuItemClass *klass)
@@ -564,22 +593,17 @@ get_sinks(SoundsStatusMenuItemPrivate *priv)
   g_key_file_free(key_file);
 }
 
+/* Seed both tables at startup. The slider can be moved before the first
+ * sink info arrives and slider_to_pa_vol() asserts on a NULL table, so
+ * they must never be left unset. prop_sink_info_cb() replaces these with
+ * the device's real ladders as soon as it reads them. */
 static void
-create_volume_steps(SoundsStatusMenuItemPrivate *priv)
+apply_default_tuning(SoundsStatusMenuItemPrivate *priv)
 {
-  gint i, n;
-
-  n = priv->normal_volume_num_steps = 20;
-  priv->normal_volume_steps = g_new(gint, n);
-
-  for (i = 0; i < n; i++)
-    priv->normal_volume_steps[i] = (i * 65536.0f) / n;
-
-  n = priv->incall_volume_num_steps = 10;
-  priv->incall_volume_steps = g_new(gint, n);
-
-  for (i = 0; i < n; i++)
-    priv->incall_volume_steps[i] = (i * 32768.0f) / n + 32768.0f;
+  parse_tuning_property(DEFAULT_NORMAL_TUNING, &priv->normal_volume_num_steps,
+                        &priv->normal_volume_steps, &priv->quark_normal);
+  parse_tuning_property(DEFAULT_INCALL_TUNING, &priv->incall_volume_num_steps,
+                        &priv->incall_volume_steps, &priv->quark_incall);
 }
 
 static void
@@ -1187,12 +1211,47 @@ prop_sink_info_cb(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
                   pa_proplist_gets(i->proplist, priv->normal_sink_property) :
                   NULL;
 
+  if (prop_normal)
+    priv->warned_normal_tuning = FALSE;
+  else
+  {
+    /* Say it once per sink change. A missing wireplumber rule should be
+     * visible in the log instead of silently substituting a curve that
+     * merely looks plausible. */
+    if (!priv->warned_normal_tuning)
+    {
+      priv->warned_normal_tuning = TRUE;
+      g_warning("VOLUME: sink %s publishes no %s; using the built-in "
+                "tuning ladder",
+                i->name,
+                priv->normal_sink_property ?
+                  priv->normal_sink_property : "tuning property");
+    }
+    prop_normal = DEFAULT_NORMAL_TUNING;
+  }
+
   parse_tuning_property(prop_normal, &priv->normal_volume_num_steps,
                         &priv->normal_volume_steps, &priv->quark_normal);
 
   prop_incall = priv->incall_sink_property ?
                   pa_proplist_gets(i->proplist, priv->incall_sink_property) :
                   NULL;
+
+  if (prop_incall)
+    priv->warned_incall_tuning = FALSE;
+  else
+  {
+    if (!priv->warned_incall_tuning)
+    {
+      priv->warned_incall_tuning = TRUE;
+      g_warning("VOLUME: sink %s publishes no %s; using the built-in "
+                "in-call tuning ladder",
+                i->name,
+                priv->incall_sink_property ?
+                  priv->incall_sink_property : "tuning property");
+    }
+    prop_incall = DEFAULT_INCALL_TUNING;
+  }
 
   parse_tuning_property(prop_incall, &priv->incall_volume_num_steps,
                         &priv->incall_volume_steps, &priv->quark_incall);
@@ -1436,7 +1495,7 @@ sounds_status_menu_item_init(SoundsStatusMenuItem *menu_item)
   priv->native_landscape = FALSE;
 
   get_sinks(priv);
-  create_volume_steps(priv);
+  apply_default_tuning(priv);
   grab_keys(priv);
 
   gdk_window_set_events(GDK_ROOT_PARENT(),
