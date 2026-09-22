@@ -1168,8 +1168,14 @@ prop_sink_info_cb(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
 
   g_assert((priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item)));
 
-  if (i && (priv->normal_channels == 0) &&
-      g_str_equal(priv->normal_sink_name, i->name))
+  /* Track the channel count of the sink we are currently following. The
+   * previous "set only while zero" guard latched the first value it saw:
+   * after the default sink changed to a device with a different layout the
+   * applet kept writing the old channel count, and if the matching info ever
+   * arrived late the count stayed 0, which makes pa_cvolume invalid and gets
+   * the write rejected client-side (pa_context_set_sink_volume_by_name()
+   * returns NULL) so the volume silently stops changing. */
+  if (i && priv->normal_sink_name && g_str_equal(priv->normal_sink_name, i->name))
   {
     priv->normal_channels = i->channel_map.channels;
   }
@@ -1288,14 +1294,19 @@ set_volume(SoundsStatusMenuItem *menu_item, int volume)
   else
   {
     pa_cvolume cv;
+    pa_operation *o;
+
+    if (priv->normal_channels == 0)
+    {
+      g_warning("VOLUME: no channel count for sink %s yet, not setting volume",
+                priv->normal_sink_name ? priv->normal_sink_name : "(null)");
+      return;
+    }
+
     priv->normal_volume = volume;
     priv->normal_volume_set = TRUE;
 
-    for (guint8 i = 0; i < priv->normal_channels; ++i)
-      cv.values[i] = volume;
-
-    cv.channels = priv->normal_channels;
-    pa_operation *o;
+    pa_cvolume_set(&cv, priv->normal_channels, volume);
 
     o = pa_context_set_sink_volume_by_name(
         priv->pa_context, priv->normal_sink_name, &cv, error_callback, NULL);
