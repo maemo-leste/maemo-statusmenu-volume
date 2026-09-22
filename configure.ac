@@ -25,11 +25,9 @@ AM_PROG_CC_STDC
 AC_HEADER_STDC
 AC_DISABLE_STATIC
 AC_PROG_LIBTOOL
-AM_GCONF_SOURCE_2
 
 PKG_CHECK_MODULES(STATUS_MENU_VOLUME,
 	[
-		gconf-2.0 dnl
 		hildon-1 dnl
 		libhildondesktop-1 dnl
 		libosso dnl

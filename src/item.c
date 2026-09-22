@@ -2,7 +2,6 @@
 #include <X11/Xatom.h>
 #include <X11/Xlib.h>
 #include <dbus/dbus-glib-lowlevel.h>
-#include <gconf/gconf-client.h>
 #include <gdk/gdkx.h>
 #include <hildon/hildon.h>
 #include <libhildondesktop/libhildondesktop.h>
