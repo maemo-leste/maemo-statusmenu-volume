@@ -1361,6 +1361,65 @@ prop_sink_info_cb(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
     update_slider(menu_item);
 }
 
+/* Push a volume to whichever sink we are currently tracking.
+ *
+ * One sink serves both modes.  When a call starts the audio stack switches the
+ * UCM profile, which destroys the media sink and creates the call sink, and
+ * follow_default_sink() re-points normal_sink_name at the replacement.  So
+ * there is no separate "incall sink" to name - only a different tuning table
+ * applied to whatever the current sink is.
+ *
+ * The operation is kept referenced so that is_running() can actually see it.
+ * The previous code unref'd immediately, which left priv->pa_operation
+ * permanently NULL and made the in-flight guard in
+ * ext_stream_restore_read_cb() dead code.  The superseded operation is
+ * released here; the last one is released in dispose(). */
+static void
+apply_sink_volume(SoundsStatusMenuItem *menu_item, int volume)
+{
+  SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
+  pa_cvolume cv;
+  pa_operation *o;
+  pa_operation *prev;
+  gboolean prev_running;
+
+  if (!priv->pa_context)
+    return;
+
+  if (priv->normal_channels == 0)
+  {
+    g_warning("VOLUME: no channel count for sink %s yet, not setting volume",
+              priv->normal_sink_name ? priv->normal_sink_name : "(null)");
+    return;
+  }
+
+  pa_cvolume_set(&cv, priv->normal_channels, (pa_volume_t) volume);
+
+  o = pa_context_set_sink_volume_by_name(priv->pa_context,
+                                        priv->normal_sink_name, &cv,
+                                        error_callback, NULL);
+  if (!o)
+  {
+    g_warning("VOLUME: Pulse audio failure: %s %s",
+              pa_strerror(pa_context_errno(priv->pa_context)),
+              priv->normal_sink_name);
+    return;
+  }
+
+  prev = priv->pa_operation;
+  /* Read the old state before dropping the reference, not after. */
+  prev_running = prev && pa_operation_get_state(prev) == PA_OPERATION_RUNNING;
+  priv->pa_operation = o;
+
+  if (prev)
+    pa_operation_unref(prev);
+
+  g_debug("VOLUME: pushed %u to %s; tracking op %p (%s), superseded %p (%s)",
+          (unsigned) volume, priv->normal_sink_name, (void *) o,
+          pa_operation_get_state(o) == PA_OPERATION_RUNNING ? "running" : "done",
+          (void *) prev, prev_running ? "was still running" : "already finished");
+}
+
 static void
 set_volume(SoundsStatusMenuItem *menu_item, int volume)
 {
@@ -1370,6 +1429,10 @@ set_volume(SoundsStatusMenuItem *menu_item, int volume)
 
   priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
 
+  /* Both modes are remembered separately so the slider can restore each one,
+   * and both are now pushed to the sink.  The call branch used to only record
+   * the value: the slider moved, nothing was applied, and the in-call volume
+   * never reached the hardware. */
   if (priv->call_active)
   {
     priv->call_volume = volume;
@@ -1377,33 +1440,11 @@ set_volume(SoundsStatusMenuItem *menu_item, int volume)
   }
   else
   {
-    pa_cvolume cv;
-    pa_operation *o;
-
-    if (priv->normal_channels == 0)
-    {
-      g_warning("VOLUME: no channel count for sink %s yet, not setting volume",
-                priv->normal_sink_name ? priv->normal_sink_name : "(null)");
-      return;
-    }
-
     priv->normal_volume = volume;
     priv->normal_volume_set = TRUE;
-
-    pa_cvolume_set(&cv, priv->normal_channels, volume);
-
-    o = pa_context_set_sink_volume_by_name(
-        priv->pa_context, priv->normal_sink_name, &cv, error_callback, NULL);
-
-    if (o)
-      pa_operation_unref(o);
-    else
-    {
-      g_warning("VOLUME: Pulse audio failure: %s %s",
-                pa_strerror(pa_context_errno(priv->pa_context)),
-                priv->normal_sink_name);
-    }
   }
+
+  apply_sink_volume(menu_item, volume);
 }
 
 static void
