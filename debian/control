@@ -3,7 +3,7 @@ Section: libs
 Priority: optional
 Maintainer: Ivaylo Dimitrov <ivo.g.dimitrov.75@gmail.com>
 Build-Depends: debhelper (>= 9), autotools-dev, libhildondesktop1-dev,
- libhildon1-dev, libosso-dev, libgconf2-dev, libpulse-dev, osso-af-settings,
+ libhildon1-dev, libosso-dev, libpulse-dev, osso-af-settings,
  osso-systemui-tklock-dev, mce-dev
 Standards-Version: 3.7.2
 
