@@ -56,3 +56,14 @@ libtool
 # test harness build output
 tests/out/
 INSTALL
+
+# dpkg / debhelper build output
+debian/.debhelper/
+debian/debhelper-build-stamp
+debian/autoreconf.after
+debian/autoreconf.before
+debian/files
+debian/*.debhelper.log
+debian/*.substvars
+debian/*.debhelper
+debian/maemo-statusmenu-volume/
