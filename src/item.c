@@ -1413,7 +1413,26 @@ prop_sink_info_cb(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
    */
   if (!priv->mm_key)
   {
-    update_slider(menu_item);
+    /* Only sync the widget when no key press owns it.
+     *
+     * This call is what lets a read racing the banner drag the slider back.
+     * The original prop_sink_info_cb() never touched the slider outside the
+     * keypress path -- it set priv->volume and went straight to the key
+     * comparisons -- so an async read could not move the widget at all.
+     * Populating the slider here was needed for a cold start, but it made
+     * every read a writer to the same widget the banner reads at expose
+     * time, and context_subscribe_cb() fires this read on every SINK
+     * CHANGE, including the ones PipeWire emits for state, latency and
+     * port changes that have nothing to do with volume.  A read issued
+     * before our write lands can therefore complete after we have already
+     * moved the slider forward and pull it back to the pre-write value,
+     * which is the banner showing a level one press behind.
+     *
+     * volume_changed is set for the window right after a write, which
+     * covers press -> expose.  Cold start still populates, because then
+     * nothing has been written yet. */
+    if (!priv->volume_changed)
+      update_slider(menu_item);
     goto out;
   }
 
