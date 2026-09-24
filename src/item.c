@@ -65,12 +65,12 @@
  * keys appear to work even without a rule of our own.  Depending on it would
  * mean a host narrowing its match rules silently disables volume key handling
  * here.  The bus broker refcounts duplicate rules, so matching again is free.
+ *
+ * sig_call_state_ind is deliberately absent: the in-call state now comes from
+ * the sink input list (see update_call_state), which is queryable rather than
+ * edge-triggered, so a start-up during a call sees the truth instead of
+ * having missed a transition.
  */
-#define DBUS_MCE_CALL_STATE_MATCH_RULE \
-  "type='signal'," \
-  "interface='" MCE_SIGNAL_IF "'," \
-  "member='" MCE_CALL_STATE_SIG "'"
-
 #define DBUS_MCE_KEY_MATCH_RULE \
   "type='signal'," \
   "interface='" MCE_SIGNAL_IF "'," \
@@ -100,13 +100,19 @@ struct _SoundsStatusMenuItemPrivate
   gchar *default_sink_name;
   pa_context *pa_context;
   pa_glib_mainloop *pa_loop;
-  int normal_volume;
-  gboolean normal_volume_set;
+  /* Level of the sink we track.  There is one cached level because there is
+   * one tracked sink; call vs media is a choice of ladder, not a stored
+   * value. */
+  int volume;
   gboolean slider_changed;
   gdouble range_val;
-  int call_volume;
-  gboolean call_volume_set;
+  /* TRUE while at least one sink input carries media.role=phone.  Replaces
+   * the MCE sig_call_state_ind edge signal: the stream list is queryable at
+   * any moment, so an applet that starts mid-call sees the truth instead of
+   * missing a transition it was not listening for. */
   gboolean call_active;
+  /* Accumulator for the in-progress sink input scan. */
+  gboolean call_active_pending;
   gboolean portrait;
   guint8 normal_channels;
   gchar *normal_sink_name;
@@ -388,12 +394,12 @@ update_slider(SoundsStatusMenuItem *menu_item)
 
   if (priv->call_active)
   {
-    val = pa_vol_to_slider(priv->call_volume, priv->incall_volume_steps,
+    val = pa_vol_to_slider(priv->volume, priv->incall_volume_steps,
                            priv->incall_volume_num_steps);
   }
   else
   {
-    val = pa_vol_to_slider(priv->normal_volume, priv->normal_volume_steps,
+    val = pa_vol_to_slider(priv->volume, priv->normal_volume_steps,
                            priv->normal_volume_num_steps);
   }
 
@@ -441,24 +447,6 @@ dbus_filter(DBusConnection *connection, DBusMessage *message, void *user_data)
     }
     else if (error.message)
       g_warning("VOLUME: %s", error.message);
-  }
-  else if (dbus_message_is_signal(message, MCE_SIGNAL_IF, MCE_CALL_STATE_SIG))
-  {
-    const gchar *type;
-    const gchar *state;
-
-    if (dbus_message_get_args(message, &error,
-                              DBUS_TYPE_STRING, &state,
-                              DBUS_TYPE_STRING, &type,
-                              DBUS_TYPE_INVALID))
-    {
-      priv->call_active = g_str_equal(state, MCE_CALL_STATE_ACTIVE);
-      update_slider(menu_item);
-    }
-    else if (error.message)
-    {
-      g_warning("VOLUME: %s", error.message);
-    }
   }
   else if (dbus_message_is_signal(message, MCE_SIGNAL_IF, MCE_DISPLAY_SIG))
   {
@@ -629,104 +617,108 @@ screen_size_changed_cb(GdkScreen *screen, gpointer user_data)
     gdk_screen_get_height(screen) > gdk_screen_get_width(screen);
 }
 
+/* Stream roles that mean "this stream is a call".
+ *
+ * libpulse documents media.role as one of "video", "music", "game",
+ * "event", "phone", "animation", "production", "a11y", "test"
+ * (proplist.h), so "phone" is the standard marker on the Pulse side and
+ * is what Fremantle used.
+ *
+ * The PipeWire / XDG portal world uses a capitalised convention with
+ * "Communication" for interactive voice, and wireplumber stores the role
+ * verbatim -- formKey() in scripts/node/state-stream.lua performs no
+ * normalisation -- so both spellings occur in practice in
+ * ~/.local/state/wireplumber/stream-properties.  Match case-insensitively
+ * against both so a call is not missed depending on who set the role.
+ */
+static const char *const call_media_roles[] = {
+  "phone",
+  "communication",
+  NULL
+};
+
 static gboolean
-is_running(SoundsStatusMenuItem *menu_item)
+is_call_media_role(const char *role)
 {
-  SoundsStatusMenuItemPrivate *priv;
+  const char *const *r;
 
-  g_return_val_if_fail(SOUND_STATUS_MENU_ITEM(menu_item), FALSE);
+  if (!role)
+    return FALSE;
 
-  priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
-
-  if (priv->pa_operation &&
-      (pa_operation_get_state(priv->pa_operation) == PA_OPERATION_RUNNING))
-  {
-    return TRUE;
-  }
+  for (r = call_media_roles; *r; r++)
+    if (g_ascii_strcasecmp(role, *r) == 0)
+      return TRUE;
 
   return FALSE;
 }
 
+/* Is any sink input carrying a call?
+ *
+ * The role is the marker.  Nothing on Leste sets a call role by default
+ * yet; a wireplumber rule keyed on application.process.binary is the
+ * intended producer.  What matters here is that the answer comes from a
+ * queryable list rather than an edge-triggered signal, so the applet can
+ * ask at any point -- including immediately after starting up mid-call.
+ *
+ * A circuit-switched call has no host stream at all: the modem drives the
+ * codec directly through the UCM Voice Call verb, and the call node is a
+ * separate sink whose own ladder already is the call ladder.  This check
+ * exists so that a VOIP stream played through a *media* sink gets that
+ * sink's in-call ladder instead of the media one.
+ */
 static void
-ext_stream_restore_read_cb(pa_context *c,
-                           const pa_ext_stream_restore_info *info, int eol,
-                           void *userdata)
+call_state_scan_cb(pa_context *c, const pa_sink_input_info *i, int eol,
+                  void *userdata)
 {
   SoundsStatusMenuItem *menu_item = userdata;
   SoundsStatusMenuItemPrivate *priv;
 
+  (void)c;
   g_assert(menu_item);
 
   priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
 
   if (eol < 0)
   {
-    g_warning("VOLUME: Failed to initialized stream_restore extension: %s",
+    g_warning("VOLUME: sink input enumeration failed: %s",
               pa_strerror(pa_context_errno(c)));
     return;
   }
 
-  if (eol)
-    return;
-
-  if (is_running(menu_item))
-    return;
-
-  if (priv->pa_operation)
+  if (eol > 0)
   {
-    pa_operation_unref(priv->pa_operation);
-    priv->pa_operation = NULL;
+    if (priv->call_active != priv->call_active_pending)
+    {
+      priv->call_active = priv->call_active_pending;
+      g_debug("VOLUME: call state is now %s",
+              priv->call_active ? "active" : "idle");
+      update_slider(menu_item);
+    }
+    return;
   }
 
-  if (priv->call_active &&
-      g_str_equal(info->name, "sink-input-by-media-role:phone"))
-  {
-    priv->call_volume = pa_cvolume_avg(&info->volume);
-  }
-  else if (g_str_equal(info->name, "sink-input-by-media-role:x-maemo"))
-  {
-    priv->normal_volume = pa_cvolume_avg(&info->volume);
-  }
-  else
+  if (!i)
     return;
 
-  if (priv->parent_window_mapped)
-    update_slider(menu_item);
+  if (is_call_media_role(pa_proplist_gets(i->proplist, PA_PROP_MEDIA_ROLE)))
+    priv->call_active_pending = TRUE;
 }
 
 static void
-pa_ext_stream_restore_subscribe_cb(pa_context *c, void *userdata)
+update_call_state(SoundsStatusMenuItem *menu_item)
 {
-  pa_operation *o =
-    pa_ext_stream_restore_read(c, ext_stream_restore_read_cb, userdata);
-
-  if (o)
-    pa_operation_unref(o);
-  else
-    g_warning("VOLUME: pa_ext_stream_restore_read() failed");
-}
-
-static void
-ext_stream_restore_test_cb(pa_context *c, uint32_t version, void *userdata)
-{
-  SoundsStatusMenuItem *menu_item = userdata;
+  SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
   pa_operation *o;
 
-  g_assert(menu_item);
+  if (!priv->pa_context)
+    return;
 
-  o = pa_ext_stream_restore_read(c, ext_stream_restore_read_cb, menu_item);
+  priv->call_active_pending = FALSE;
 
+  o = pa_context_get_sink_input_info_list(priv->pa_context,
+                                          call_state_scan_cb, menu_item);
   if (o)
-  {
     pa_operation_unref(o);
-    pa_ext_stream_restore_set_subscribe_cb(c,
-                                           pa_ext_stream_restore_subscribe_cb,
-                                           menu_item);
-    o = pa_ext_stream_restore_subscribe(c, 1, NULL, NULL);
-
-    if (o)
-      pa_operation_unref(o);
-  }
 }
 
 static void
@@ -778,6 +770,12 @@ context_subscribe_cb(pa_context *c, pa_subscription_event_type_t t,
       follow_default_sink(menu_item);
       break;
 
+    case PA_SUBSCRIPTION_EVENT_SINK_INPUT:
+      /* A stream appearing or disappearing can start or end a call as far
+       * as this applet is concerned. */
+      update_call_state(menu_item);
+      break;
+
     default:
       break;
   }
@@ -791,7 +789,8 @@ pa_subscribe_events(pa_context *c)
   o = pa_context_subscribe(c,
                            PA_SUBSCRIPTION_MASK_SINK|
                            PA_SUBSCRIPTION_MASK_SOURCE|
-                           PA_SUBSCRIPTION_MASK_SERVER,
+                           PA_SUBSCRIPTION_MASK_SERVER|
+                           PA_SUBSCRIPTION_MASK_SINK_INPUT,
                            NULL,
                            NULL);
 
@@ -863,18 +862,13 @@ context_state_callback(pa_context *c, void *userdata)
     if (state == PA_CONTEXT_READY)
     {
       pa_operation *o;
-      o = pa_ext_stream_restore_test(c, ext_stream_restore_test_cb, menu_item);
-
-      if (o)
-        pa_operation_unref(o);
-      else
-      {
-        g_critical("VOLUME: Failed to initialized stream_restore extension: %s",
-                   pa_strerror(pa_context_errno(c)));
-      }
 
       pa_context_set_subscribe_callback(c, context_subscribe_cb, menu_item);
       pa_subscribe_events(c);
+
+      /* Prime the call state before the first draw, so a start-up during a
+       * VOIP call lands on the in-call ladder. */
+      update_call_state(menu_item);
 
       if (priv->normal_sink_name_provided)
       {
@@ -1301,7 +1295,41 @@ prop_sink_info_cb(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
   parse_tuning_property(prop_incall, &priv->incall_volume_num_steps,
                         &priv->incall_volume_steps, &priv->quark_incall);
 
-  /* Nothing to do unless a key press is waiting on this read.
+  if (!i->volume.channels)
+  {
+    g_warning("VOLUME: %s: can't set volume from sink with zero channels",
+              __func__);
+    return;
+  }
+
+  /* The sink is the source of truth for the level in both modes.
+   *
+   * This must happen before the mm_key bail-out below.  The applet needs the
+   * current level just to draw the slider, and now that the role-based
+   * detector has replaced the stream-restore read callback there is no other
+   * producer: gating the assignment on a pending key press left the slider
+   * at zero until the first key was pressed. */
+  volume = i->volume.values[0];
+  priv->volume = volume;
+
+  if (priv->call_active)
+  {
+    steps = priv->incall_volume_steps;
+    steps_size = priv->incall_volume_num_steps;
+  }
+  else
+  {
+    steps = priv->normal_volume_steps;
+    steps_size = priv->normal_volume_num_steps;
+  }
+
+  g_debug("VOLUME: %s: %s volume is now %i", __func__,
+          priv->call_active ? "in-call" : "normal", priv->volume);
+
+  current_vol = pa_vol_to_slider(volume, steps, steps_size);
+
+  /* Nothing beyond keeping the display in sync unless a key press is waiting
+   * on this read.
    *
    * X_KEYCODE_UP/X_KEYCODE_DOWN are XKeysymToKeycode() results and come back
    * 0 when the keymap has no XF86XK_AudioRaiseVolume/XF86XK_AudioLowerVolume.
@@ -1311,32 +1339,10 @@ prop_sink_info_cb(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
    * from raw keycodes to X keysyms.
    */
   if (!priv->mm_key)
+  {
+    update_slider(menu_item);
     goto out;
-
-  if (priv->call_active)
-  {
-    volume = priv->call_volume;
-    steps = priv->incall_volume_steps;
-    steps_size = priv->incall_volume_num_steps;
   }
-  else
-  {
-    if (!i->volume.channels)
-    {
-      g_warning("VOLUME: %s: can't set volume from sink with zero channels",
-                __func__);
-      goto out;
-    }
-
-    volume = i->volume.values[0];
-    steps = priv->normal_volume_steps;
-    steps_size = priv->normal_volume_num_steps;
-    priv->normal_volume = volume;
-    g_debug("VOLUME: %s: normal volume is now %i", __func__,
-            priv->normal_volume);
-  }
-
-  current_vol = pa_vol_to_slider(volume, steps, steps_size);
 
   if ((!priv->portrait && priv->swap_on_rotate && priv->display_on) ||
       (!priv->display_on && priv->native_landscape))
@@ -1466,16 +1472,7 @@ set_volume(SoundsStatusMenuItem *menu_item, int volume)
    * and both are now pushed to the sink.  The call branch used to only record
    * the value: the slider moved, nothing was applied, and the in-call volume
    * never reached the hardware. */
-  if (priv->call_active)
-  {
-    priv->call_volume = volume;
-    priv->call_volume_set = TRUE;
-  }
-  else
-  {
-    priv->normal_volume = volume;
-    priv->normal_volume_set = TRUE;
-  }
+  priv->volume = volume;
 
   apply_sink_volume(menu_item, volume);
 }
@@ -1625,7 +1622,6 @@ sounds_status_menu_item_init(SoundsStatusMenuItem *menu_item)
 
   conn = dbus_g_connection_get_connection(priv->dbus);
 
-  dbus_bus_add_match(conn, DBUS_MCE_CALL_STATE_MATCH_RULE, NULL);
   dbus_bus_add_match(conn, DBUS_MCE_KEY_MATCH_RULE, NULL);
   dbus_bus_add_match(conn, DBUS_MCE_DISPLAY_MATCH_RULE, NULL);
   dbus_connection_add_filter(conn, dbus_filter, menu_item, NULL);
