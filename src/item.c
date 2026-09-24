@@ -1301,6 +1301,18 @@ prop_sink_info_cb(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
   parse_tuning_property(prop_incall, &priv->incall_volume_num_steps,
                         &priv->incall_volume_steps, &priv->quark_incall);
 
+  /* Nothing to do unless a key press is waiting on this read.
+   *
+   * X_KEYCODE_UP/X_KEYCODE_DOWN are XKeysymToKeycode() results and come back
+   * 0 when the keymap has no XF86XK_AudioRaiseVolume/XF86XK_AudioLowerVolume.
+   * With mm_key idle at 0 the comparisons further down would then evaluate
+   * 0 == 0 and turn every sink notification into a volume-up step.  This
+   * bail-out is the guard commit 585a6ab dropped when it moved the comparisons
+   * from raw keycodes to X keysyms.
+   */
+  if (!priv->mm_key)
+    goto out;
+
   if (priv->call_active)
   {
     volume = priv->call_volume;
@@ -1313,7 +1325,7 @@ prop_sink_info_cb(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
     {
       g_warning("VOLUME: %s: can't set volume from sink with zero channels",
                 __func__);
-      return;
+      goto out;
     }
 
     volume = i->volume.values[0];
@@ -1375,6 +1387,7 @@ prop_sink_info_cb(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
     }
   }
 
+out:
   priv->mm_key = 0;
 
   if (priv->parent_window_mapped)
