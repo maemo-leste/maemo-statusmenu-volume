@@ -130,5 +130,51 @@ int main(void) {
 		}
 	}
 
+	printf("\n-- droid4 HiFi normal: all hardware positions to 0 dB + one boost (ctrl 0..12) --\n");
+	{
+		const char *d4 = "-4500,-4200,-3900,-3600,-3300,-3000,-2700,-2400,"
+		                 "-2100,-1800,-1500,-1200,-900";
+		/* predicted by tests/gen-tuning-table.py --ctrl-min 0 --ctrl-max 12
+		 * --tlv-max 12 --steps 13 from the cpcap HiFi TLV */
+		const int want[13] = { 11654, 13076, 14672, 16462, 18471, 20724,
+		                       23253, 26090, 29274, 32846, 36854, 41350,
+		                       46396 };
+		int bad = 0;
+		q = 0; ns = 0; st = NULL;
+		changed = parse_tuning_property(d4, &ns, &st, &q);
+		printf("  changed=%d num_steps=%d (want 14 = silence + 13 steps) %s\n",
+		       changed, ns, (changed && ns == 14) ? "OK" : "MISMATCH");
+
+		for (int i = 0; i < 13; i++) {
+			int got = st[i + 1];
+			int hw_dB = (int) lround(pa_sw_volume_to_dB(got) + 12.0);
+			double ctrl_d = (hw_dB + 33.0) / 3.0;
+			int ok = (got == want[i]) && (fabs(ctrl_d - rint(ctrl_d)) < 1e-9);
+			if (!ok) bad++;
+			printf("    [%2d] cB=%6d got=%6d want=%6d  hw=%+3d dB ctrl=%5.2f  %s\n",
+			       i + 1, -4500 + i * 300, got, want[i], hw_dB, ctrl_d,
+			       ok ? "OK" : "MISMATCH");
+		}
+		printf("  entries: %d/13 exact hardware positions, %d mismatched\n",
+		       13 - bad, bad);
+
+		printf("  base_volume 41350 (hw 0 dB, ctrl 11) -> slider %.7f (want %.7f)\n",
+		       pa_vol_to_slider(41350, st, ns), 12.0 / 13.0);
+		printf("  slider at max -> %d (want 46396 = +3 dB boost cap, NOT 65536)\n",
+		       slider_to_pa_vol(1.0, st, ns));
+		printf("  slider at first content step -> %d (want %d = -33 dB)\n",
+		       slider_to_pa_vol(1.0 / 13.0, st, ns), want[0]);
+		printf("  above the ladder: 65536 -> slider %.4f (clamps to 1.0)\n",
+		       pa_vol_to_slider(65536, st, ns));
+		printf("  round trip at each of the 13 logical steps:\n");
+		for (int i = 1; i <= 13; i++) {
+			double s = i / 13.0;
+			int v = slider_to_pa_vol(s, st, ns);
+			double back = pa_vol_to_slider(v, st, ns);
+			printf("    slider=%.7f -> vol=%6d -> back=%.7f %s\n",
+			       s, v, back, fabs(back - s) < 1e-9 ? "OK" : "DRIFT");
+		}
+	}
+
 	return 0;
 }
