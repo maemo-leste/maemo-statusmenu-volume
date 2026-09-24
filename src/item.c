@@ -113,6 +113,11 @@ struct _SoundsStatusMenuItemPrivate
   gboolean call_active;
   /* Accumulator for the in-progress sink input scan. */
   gboolean call_active_pending;
+  /* First call-role stream found by the scan.  While a call is active the
+   * slider reads from and writes to this stream instead of the sink, which
+   * is what keeps media and VOIP volume independent. */
+  uint32_t call_input_index;
+  int call_input_volume;
   gboolean portrait;
   guint8 normal_channels;
   gchar *normal_sink_name;
@@ -687,13 +692,36 @@ call_state_scan_cb(pa_context *c, const pa_sink_input_info *i, int eol,
 
   if (eol > 0)
   {
-    if (priv->call_active != priv->call_active_pending)
-    {
-      priv->call_active = priv->call_active_pending;
+    gboolean changed = priv->call_active != priv->call_active_pending;
+
+    priv->call_active = priv->call_active_pending;
+
+    if (changed)
       g_debug("VOLUME: call state is now %s",
               priv->call_active ? "active" : "idle");
-      update_slider(menu_item);
+
+    if (priv->call_active)
+    {
+      if (priv->call_input_index == PA_INVALID_INDEX)
+        return;
+
+      if (changed || priv->volume != priv->call_input_volume)
+      {
+        /* The slider now rides the call stream rather than the sink.
+         * Leaving the sink alone is the whole point: media volume keeps
+         * whatever the user left there, and the call gets its own level,
+         * which wireplumber then persists under media.role. */
+        priv->volume = priv->call_input_volume;
+        update_slider(menu_item);
+      }
     }
+    else if (changed)
+    {
+      /* Call over.  Hand the slider back to the sink we deliberately did
+       * not touch during the call. */
+      get_normal_sink_info(menu_item, priv);
+    }
+
     return;
   }
 
@@ -701,7 +729,15 @@ call_state_scan_cb(pa_context *c, const pa_sink_input_info *i, int eol,
     return;
 
   if (is_call_media_role(pa_proplist_gets(i->proplist, PA_PROP_MEDIA_ROLE)))
+  {
     priv->call_active_pending = TRUE;
+
+    if (priv->call_input_index == PA_INVALID_INDEX && i->volume.channels > 0)
+    {
+      priv->call_input_index = i->index;
+      priv->call_input_volume = i->volume.values[0];
+    }
+  }
 }
 
 static void
@@ -714,6 +750,8 @@ update_call_state(SoundsStatusMenuItem *menu_item)
     return;
 
   priv->call_active_pending = FALSE;
+  priv->call_input_index = PA_INVALID_INDEX;
+  priv->call_input_volume = 0;
 
   o = pa_context_get_sink_input_info_list(priv->pa_context,
                                           call_state_scan_cb, menu_item);
@@ -1295,22 +1333,33 @@ prop_sink_info_cb(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
   parse_tuning_property(prop_incall, &priv->incall_volume_num_steps,
                         &priv->incall_volume_steps, &priv->quark_incall);
 
-  if (!i->volume.channels)
-  {
-    g_warning("VOLUME: %s: can't set volume from sink with zero channels",
-              __func__);
-    return;
-  }
-
-  /* The sink is the source of truth for the level in both modes.
+  /* The source of truth for the slider depends on the mode.
    *
-   * This must happen before the mm_key bail-out below.  The applet needs the
-   * current level just to draw the slider, and now that the role-based
-   * detector has replaced the stream-restore read callback there is no other
-   * producer: gating the assignment on a pending key press left the slider
-   * at zero until the first key was pressed. */
-  volume = i->volume.values[0];
-  priv->volume = volume;
+   * Out of a call it is the sink.  During one it is the call stream: the
+   * sink says nothing about a level we deliberately keep off it, and
+   * copying the sink level here would wipe the call volume the moment any
+   * unrelated sink event arrived.
+   *
+   * Either way this has to happen before the mm_key bail-out below -- the
+   * applet needs the current level just to draw the slider, and since the
+   * role-based detector replaced the stream-restore read callback there is
+   * no other producer for the media case. */
+  if (priv->call_active)
+  {
+    volume = priv->volume;
+  }
+  else
+  {
+    if (!i->volume.channels)
+    {
+      g_warning("VOLUME: %s: can't set volume from sink with zero channels",
+                __func__);
+      return;
+    }
+
+    volume = i->volume.values[0];
+    priv->volume = volume;
+  }
 
   if (priv->call_active)
   {
@@ -1402,17 +1451,16 @@ out:
 
 /* Push a volume to whichever sink we are currently tracking.
  *
- * One sink serves both modes.  When a call starts the audio stack switches the
- * UCM profile, which destroys the media sink and creates the call sink, and
- * follow_default_sink() re-points normal_sink_name at the replacement.  So
- * there is no separate "incall sink" to name - only a different tuning table
- * applied to whatever the current sink is.
+ * Used for the media path.  During a call that has a host stream the level
+ * goes to the stream instead (see apply_call_volume), so the sink keeps
+ * the media level the user set.  A circuit-switched call has no host
+ * stream at all and still arrives here, onto the call node that
+ * follow_default_sink() re-pointed normal_sink_name at when the UCM
+ * profile switch destroyed the media sink -- which is why there is no
+ * separate "incall sink" to name.
  *
- * The operation is kept referenced so that is_running() can actually see it.
- * The previous code unref'd immediately, which left priv->pa_operation
- * permanently NULL and made the in-flight guard in
- * ext_stream_restore_read_cb() dead code.  The superseded operation is
- * released here; the last one is released in dispose(). */
+ * The operation is kept referenced so the previous one can be released
+ * without losing track of it; the last one is released in dispose(). */
 static void
 apply_sink_volume(SoundsStatusMenuItem *menu_item, int volume)
 {
@@ -1459,6 +1507,76 @@ apply_sink_volume(SoundsStatusMenuItem *menu_item, int volume)
           (void *) prev, prev_running ? "was still running" : "already finished");
 }
 
+/* Push the current level to every sink input carrying a call role.
+ *
+ * This is what makes media and VOIP independent.  Writing the sink moves
+ * the call and the media together; writing the stream leaves the media
+ * sink exactly where the user left it.  wireplumber's session restore is
+ * keyed on media.role, so the call level also survives a stack restart
+ * with nothing for this applet to persist.
+ *
+ * The writes are issued from inside the enumeration callback on purpose.
+ * The server snapshots the list before the callback runs, so writing does
+ * not disturb iteration, and there is no index list to keep alive between
+ * calls.  Every call-role stream gets the same value: "the call volume"
+ * is one number, not one per app.
+ */
+static void
+call_volume_write_cb(pa_context *c, const pa_sink_input_info *i, int eol,
+                    void *userdata)
+{
+  SoundsStatusMenuItem *menu_item = userdata;
+  SoundsStatusMenuItemPrivate *priv;
+  pa_operation *o;
+  pa_cvolume cv;
+
+  priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
+
+  if (eol != 0 || !i)
+    return;
+
+  if (!is_call_media_role(pa_proplist_gets(i->proplist, PA_PROP_MEDIA_ROLE)))
+    return;
+
+  if (i->volume.channels == 0)
+    return;
+
+  pa_cvolume_set(&cv, i->volume.channels, (pa_volume_t) priv->volume);
+
+  o = pa_context_set_sink_input_volume(c, i->index, &cv, error_callback, NULL);
+  if (!o)
+  {
+    g_warning("VOLUME: failed to set call stream %u: %s", i->index,
+              pa_strerror(pa_context_errno(c)));
+    return;
+  }
+
+  g_debug("VOLUME: pushed %d to call stream %u (%s)", priv->volume, i->index,
+          pa_proplist_gets(i->proplist, PA_PROP_APPLICATION_NAME));
+  pa_operation_unref(o);
+}
+
+static void
+apply_call_volume(SoundsStatusMenuItem *menu_item)
+{
+  SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
+  pa_operation *o;
+
+  if (!priv->pa_context)
+    return;
+
+  o = pa_context_get_sink_input_info_list(priv->pa_context,
+                                         call_volume_write_cb, menu_item);
+  if (!o)
+  {
+    g_warning("VOLUME: failed to enumerate call streams: %s",
+              pa_strerror(pa_context_errno(priv->pa_context)));
+    return;
+  }
+
+  pa_operation_unref(o);
+}
+
 static void
 set_volume(SoundsStatusMenuItem *menu_item, int volume)
 {
@@ -1468,13 +1586,15 @@ set_volume(SoundsStatusMenuItem *menu_item, int volume)
 
   priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
 
-  /* Both modes are remembered separately so the slider can restore each one,
-   * and both are now pushed to the sink.  The call branch used to only record
-   * the value: the slider moved, nothing was applied, and the in-call volume
-   * never reached the hardware. */
+  /* Route by mode.  In a call the level belongs to the stream so that
+   * media volume is not dragged along with it; out of a call there is no
+   * stream to write to and the sink is the only thing there is. */
   priv->volume = volume;
 
-  apply_sink_volume(menu_item, volume);
+  if (priv->call_active)
+    apply_call_volume(menu_item);
+  else
+    apply_sink_volume(menu_item, volume);
 }
 
 static void
