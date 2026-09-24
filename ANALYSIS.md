@@ -403,6 +403,91 @@ the quantisation is acceptable.
 
 ---
 
+## 4c. MCE signal delivery and the shared D-Bus connection
+
+The plugin handles three MCE signals but only ever matched one of them:
+
+```c
+#define DBUS_MCE_MATCH_RULE \
+  "type='signal'," \
+  "interface='" MCE_SIGNAL_IF "'," \
+  "member='" MCE_CALL_STATE_SIG "'"
+```
+
+`sig_key_event_ind` and `display_status_ind` had handlers in `dbus_filter()`
+but no match rule. Commit `585a6ab` ("Port from tklock to mce interfaces")
+rewired the handlers and dropped the tklock match rule without adding the MCE
+ones.
+
+**Yet the volume keys work on device.** They arrive by borrowing another
+component's match rule.
+
+`hildon-status-menu/src/hd-display.c:124` registers a match on the *whole*
+interface:
+
+```c
+priv->system_bus = dbus_bus_get(DBUS_BUS_SYSTEM, &error);
+dbus_bus_add_match(priv->system_bus,
+                   "type='signal', interface='" MCE_SIGNAL_IF "'", NULL);
+```
+
+and `dbus_bus_get()` and `dbus_g_bus_get()` return the **same process-wide
+shared `DBusConnection`** (libdbus shares one connection per bus type per
+process; dbus-glib wraps that same object):
+
+```
+raw  dbus_bus_get()        = 0x55b647cc7220
+glib dbus_g_bus_get()      = 0x55b647cc7228 -> 0x55b647cc7220
+SAME CONNECTION (raw == glib)?  YES
+```
+
+So the host's broad match feeds our filter. Verified by instrumenting the
+plugin's `dbus_filter()` and running it inside the real `hildon-status-menu`
+(still carrying only the `call_state` rule), with a real key injected via
+`/dev/input` so that it passes through MCE's `key-dbus.c`:
+
+```
+[PLUGIN-SIG] iface=com.nokia.mce.signal member=sig_key_event_ind   x4
+before:     19193
+after UP:   17775
+after DOWN: 19193
+```
+
+### Why this is fragile
+
+Nothing in this plugin records that its volume-key handling depends on the
+host having registered a broad interface match. If `hildon-status-menu`
+ever narrows `hd-display.c` to specific members - an ordinary optimisation -
+volume key handling stops working here with no error and no warning.
+
+Fixed by giving each consumed signal its own match rule (`437ef32`). The bus
+broker refcounts duplicate rules, so matching `sig_call_state_ind` a second
+time costs nothing.
+
+### Testing note - why the harness lied
+
+`tests/host-plugin` loads the plugin **without** `HDDisplay`, so there is no
+broad match and no key delivery. Reading the code together with that harness
+makes the key handler look like dead code. It is not - the harness just does
+not reproduce the host environment. Any future key/signal testing must use
+either the real status menu (`DEBUG_OUTPUT=1 maemo-summoner
+/usr/bin/hildon-status-menu.launch`, which suppresses all output unless
+`DEBUG_OUTPUT` is set) or a harness that installs the match rules itself.
+
+### Other MCE facts
+
+- `display_on` initialises to `TRUE` and is updated by `display_status_ind`,
+  which *is* delivered via the borrowed match. It is not stuck.
+- Rotation detection does not use MCE at all: it is a `GdkScreen`
+  `size-changed` handler.
+- `grab_keys()` sets `priv->keys_are_grabbed = TRUE` without checking whether
+  `XGrabKey` succeeded, so the `keys_are_grabbed` guard in the key handler
+  does not actually test anything. The X grab is a claim on the root window
+  with `owner_events=True`; there is no `KeyPress` handler anywhere in the
+  plugin, so X-delivered volume key events go nowhere.
+
+---
+
 ## 5. What is *not* broken
 
 To avoid chasing ghosts: the **normal (non-call) volume path works today** under
