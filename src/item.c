@@ -97,14 +97,12 @@ struct _SoundsStatusMenuItemPrivate
   GtkWidget *hscale;
   GtkWidget *image;
   gulong hscale_value_changed_id;
-  gchar *default_sink_name;
   pa_context *pa_context;
   pa_glib_mainloop *pa_loop;
   /* Level of the sink we track.  There is one cached level because there is
    * one tracked sink; call vs media is a choice of ladder, not a stored
    * value. */
   int volume;
-  gboolean slider_changed;
   gdouble range_val;
   /* TRUE while at least one sink input carries media.role=phone.  Replaces
    * the MCE sig_call_state_ind edge signal: the stream list is queryable at
@@ -249,6 +247,31 @@ hildon_get_dnd(Window w)
     int format;
     Atom type;
 
+    /* Presence is treated as the flag, deliberately.
+     *
+     * The canonical setter -- hildon_gtk_window_set_clear_window_flag()
+     * in libhildon -- writes XA_INTEGER, format 32, one item, value 1,
+     * and clears DND by DELETING the property.  So the only things a
+     * conforming client can produce are "absent" and "INTEGER/32/1 = 1",
+     * and a presence test answers both correctly.
+     *
+     * The desktop's own reader -- hd_comp_mgr_check_do_not_disturb_flag()
+     * in hildon-desktop -- is stricter: it validates type, format and
+     * item count and then requires the value to be exactly 1.  We
+     * deliberately do not follow it.  This is a do-not-disturb flag, so
+     * the conservative failure mode is the one that honours it: a client
+     * that set the atom in some unusual way still does not want to be
+     * disturbed, and suppressing a volume banner is harmless while
+     * showing one against a user's explicit request is not.
+     *
+     * Worth recording: the XA_INTEGER type filter does NOT guard this
+     * call.  Measured -- querying a CARDINAL or STRING property with
+     * type=XA_INTEGER still returns Success with a non-NULL pointer and
+     * nitems == 0.  So a wrong-typed property does reach the "is set"
+     * branch here.  That is the outcome we want, but it is not the same
+     * thing as having validated a type, and anyone tempted to treat the
+     * filter as validation should know.
+     */
     XGetWindowProperty(GDK_DISPLAY(), w, atom, 0, 1, False, XA_INTEGER, &type,
                        &format, &n_items, &bytes_after, (unsigned char **)&val);
 
@@ -824,9 +847,10 @@ pa_subscribe_events(pa_context *c)
 {
   pa_operation *o;
 
+  /* No SOURCE mask: nothing in this plugin reads sources, and taking the
+   * mask only wakes us to fall straight through the switch. */
   o = pa_context_subscribe(c,
                            PA_SUBSCRIPTION_MASK_SINK|
-                           PA_SUBSCRIPTION_MASK_SOURCE|
                            PA_SUBSCRIPTION_MASK_SERVER|
                            PA_SUBSCRIPTION_MASK_SINK_INPUT,
                            NULL,
@@ -1617,7 +1641,6 @@ hscale_value_changed_cb(GtkRange *range, gpointer user_data)
                               priv->normal_volume_num_steps);
   }
 
-  priv->slider_changed = TRUE;
   set_volume(menu_item, pa_vol);
   set_volume_icon(menu_item, gtk_range_get_value(GTK_RANGE(range)) * 100.0f);
 }
