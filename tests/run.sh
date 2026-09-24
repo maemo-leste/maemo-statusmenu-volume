@@ -8,7 +8,7 @@ set -e
 cd "$(dirname "$0")/.."
 SRC=src
 PKG="glib-2.0 libpulse libpulse-mainloop-glib gtk+-2.0 libhildondesktop-1 \
-     hildon-1 libosso dbus-glib-1 mce x11 gconf-2.0"
+     hildon-1 libosso dbus-glib-1 mce x11"
 
 mkdir -p tests/out
 
@@ -38,4 +38,15 @@ if [ -n "$DISPLAY" ]; then
 	tests/out/host-plugin "$SRC/.libs/volume_status_menu_item.so" || true
 else
 	echo "(skipped: no DISPLAY)"
+fi
+
+echo
+echo "### 5. check-ladders: push the ladders shipped by maemo-audio through the real parser"
+gcc -O0 -g -fsanitize=address -I"$SRC" -I. -o tests/out/check-ladders tests/check-ladders.c \
+	$(pkg-config --cflags --libs $PKG) -lm
+LADDER_CONF="${LADDER_CONF:-../maemo-audio/maemo-audio-droid4/etc/wireplumber/wireplumber.conf.d/50-maemo-volume-droid4.conf}"
+if [ -f "$LADDER_CONF" ]; then
+	ASAN_OPTIONS=detect_leaks=0 tests/out/check-ladders "$LADDER_CONF"
+else
+	echo "(skipped: $LADDER_CONF not found; point LADDER_CONF at a device drop-in)"
 fi
