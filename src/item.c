@@ -56,10 +56,30 @@
      menu_item))
 #endif
 
-#define DBUS_MCE_MATCH_RULE \
+/* Every MCE signal this plugin consumes gets its own match rule.
+ *
+ * We deliberately do not rely on the broad "interface='com.nokia.mce.signal'"
+ * match that our host process (hildon-status-menu, see hd-display.c) installs.
+ * dbus_bus_get() and dbus_g_bus_get() return the same process-wide shared
+ * DBusConnection, so that broad match also feeds our filter and the volume
+ * keys appear to work even without a rule of our own.  Depending on it would
+ * mean a host narrowing its match rules silently disables volume key handling
+ * here.  The bus broker refcounts duplicate rules, so matching again is free.
+ */
+#define DBUS_MCE_CALL_STATE_MATCH_RULE \
   "type='signal'," \
   "interface='" MCE_SIGNAL_IF "'," \
   "member='" MCE_CALL_STATE_SIG "'"
+
+#define DBUS_MCE_KEY_MATCH_RULE \
+  "type='signal'," \
+  "interface='" MCE_SIGNAL_IF "'," \
+  "member='" MCE_KEY_SIG "'"
+
+#define DBUS_MCE_DISPLAY_MATCH_RULE \
+  "type='signal'," \
+  "interface='" MCE_SIGNAL_IF "'," \
+  "member='" MCE_DISPLAY_SIG "'"
 
 #define X_KEYCODE_DOWN (XKeysymToKeycode(GDK_DISPLAY(), XF86XK_AudioLowerVolume))
 #define X_KEYCODE_UP (XKeysymToKeycode(GDK_DISPLAY(), XF86XK_AudioRaiseVolume))
@@ -1592,7 +1612,9 @@ sounds_status_menu_item_init(SoundsStatusMenuItem *menu_item)
 
   conn = dbus_g_connection_get_connection(priv->dbus);
 
-  dbus_bus_add_match(conn, DBUS_MCE_MATCH_RULE, NULL);
+  dbus_bus_add_match(conn, DBUS_MCE_CALL_STATE_MATCH_RULE, NULL);
+  dbus_bus_add_match(conn, DBUS_MCE_KEY_MATCH_RULE, NULL);
+  dbus_bus_add_match(conn, DBUS_MCE_DISPLAY_MATCH_RULE, NULL);
   dbus_connection_add_filter(conn, dbus_filter, menu_item, NULL);
 
   hbox = gtk_hbox_new(FALSE, 0);
