@@ -1,3 +1,18 @@
+maemo-statusmenu-volume (1.0) unstable; urgency=medium
+
+  * New tuning format: x-maemo.volume.tuning and .incall, ascending centibels
+  * Ladders come from wireplumber, N900 tables are the fallback
+  * In-call ladder is picked from phone-role sink inputs, not MCE call_state
+  * In-call volume is now actually written to the sink
+  * Call stream is driven directly, media and VOIP volumes are independent
+  * Track the current sink's channel count instead of the first one seen
+  * Own the MCE key and display match rules instead of relying on the host
+  * Ignore an idle mm_key rather than reading it as volume-up
+  * Fix crash paths on NULL proplist key and ladders shorter than two steps
+  * Drop the unused GConf dependency
+
+ -- Ivaylo Dimitrov <ivo.g.dimitrov.75@gmail.com>  Sat, 26 Sep 2026 08:39:31 +0300
+
 maemo-statusmenu-volume (0.57) unstable; urgency=low
 
   * Find default sink name upon connect
