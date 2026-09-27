@@ -8,37 +8,160 @@
 #include <linux/input.h>
 #include <mce/dbus-names.h>
 #include <mce/mode-names.h>
-#include <pulse/channelmap.h>
-#include <pulse/context.h>
-#include <pulse/error.h>
-#include <pulse/ext-stream-restore.h>
-#include <pulse/glib-mainloop.h>
-#include <pulse/introspect.h>
-#include <pulse/subscribe.h>
-#include <pulse/volume.h>
+#include <pipewire/extensions/metadata.h>
+#include <pipewire/pipewire.h>
+#include <spa/pod/builder.h>
+#include <spa/pod/iter.h>
+#include <spa/pod/pod.h>
+#include <spa/pod/vararg.h>
+#include <spa/param/audio/raw.h>
+#include <spa/param/props.h>
+#include <spa/utils/defs.h>
+#include <spa/utils/json.h>
 
 #include <math.h>
 #include <string.h>
 
 #define CONFIGURATION_FILE "/usr/share/maemo-statusmenu-volume/sinks.ini"
 
-/* Fallback tuning tables, used when the sink publishes no tuning property.
+/* No tuning table is compiled in. Every ladder this applet uses comes
+ * from the sink node it is bound to, published by the audio stack (the
+ * wireplumber rules in maemo-audio). A second copy here would be a
+ * second thing to keep in step, and a curve that silently disagrees with
+ * the hardware is worse than no curve at all.
  *
- * Format: comma separated gain values in centibel, ascending. The values
- * below are the N900 internal-speaker ladders from community-ssu/
- * pulseaudio-nokia, src/common/data/ihf.parameters (mixer_tuning and
- * alt_mixer_tuning), which gives 20 steps for media and 10 for in-call.
- *
- * They are a sane generic default, not a claim about the hardware in hand.
- * The real per-device curves should be published by the audio stack (a
- * wireplumber monitor.alsa.rules drop-in in maemo-audio), which overrides
- * these. */
-#define DEFAULT_NORMAL_TUNING \
-  "-4000,-3800,-3600,-3400,-3200,-3000,-2800,-2600,-2400,-2200," \
-  "-2000,-1600,-1400,-1200,-1000,-800,-600,-400,-200,0"
+ * Until a ladder has been read there is nothing to map against, so the
+ * slider is insensitive and the volume keys are ignored. See
+ * have_ladder(). */
 
-#define DEFAULT_INCALL_TUNING \
-  "-2000,-1600,-1400,-1200,-1000,-800,-600,-400,-200,0"
+/* The keys the audio stack publishes the ladders under, and the ones
+ * this applet reads. sinks.ini can name different ones; these are the
+ * default it falls back to so an absent override does not read as "no
+ * ladder". */
+#define TUNING_KEY         "x-maemo.volume.tuning"
+#define TUNING_INCALL_KEY  "x-maemo.volume.tuning.incall"
+
+/* No volume ramp here.  The ramp in audioconvert is driven by the node's
+ * master `volume` (prev_volume -> volume), and the level this applet owns
+ * lives in channelVolumes, so asking for a ramp would leave `volume`
+ * untouched and make audioconvert log "no change in volume, cannot ramp
+ * volume" on every write.  A hard step is also exactly what the
+ * PulseAudio path did. */
+
+/* How long to sit out before retrying a failed PipeWire connection. */
+#define RECONNECT_DELAY_SECONDS 2
+
+/* Volume intent, written on the tracked sink node and read back for the
+ * slider.
+ *
+ * The applet does not set the sink volume.  A sink's level is owned by the
+ * card route: pipewire-pulse writes it with pw_device_set_param(SPA_PARAM_
+ * Route, save=true) and reads it back out of that same route, so a bare
+ * node Props write leaves every PulseAudio client quoting a stale number
+ * and skips the per-port persistence the route store provides.  Writing a
+ * target instead keeps one writer for the sink -- the policy -- and leaves
+ * this applet holding only what the user asked for. */
+#define TARGET_KEY "x-maemo.volume.target"
+
+/* Tuning centibels to the internal step scale.
+ *
+ * This is the perceptual (cubic) mapping, not the linear one: 60 dB per
+ * decade, so 0 dB lands on the norm and -60 dB lands on a tenth of it.
+ * 65536 is the same anchor the tables have always produced, which keeps
+ * every stored ladder reading the same as before.
+ *
+ * Verified bit-for-bit against pa_sw_volume_from_dB() over -8000..+1200 cB
+ * (9201 values, zero differences).  Note that lrint() is what matches:
+ * truncating disagrees with PulseAudio on about half of all values, which
+ * would silently shift every ladder by a step. */
+#define VOLUME_NORM 65536.0
+
+static gint
+tuning_cb_to_volume(gint centibel)
+{
+  double db = (double)centibel / 100.0;
+
+  return (gint)lrint(VOLUME_NORM * pow(10.0, db / 60.0));
+}
+
+/* PipeWire carries volume as linear amplitude; the tables, the ladder math
+ * and every cached level in here are on the perceptual (cubic) scale where
+ * 65536 is 0 dB and -60 dB is 6554.  These two are the only place the two
+ * scales meet, and they are the exact inverse of pipewire-pulse's own
+ * volume_to_linear() / volume_from_linear() in module-protocol-pulse, so a
+ * level written here lands where the PulseAudio path would have put it.
+ *
+ * Note this is a cube, not a divide-by-65536.  Treating the step scale as
+ * linear puts every level somewhere else entirely: the sink's 13107
+ * (-41.94 dB) is 0.008 linear, not 0.2. */
+static inline gint
+spa_volume_to_step(float v)
+{
+  if (v <= 0.0f)
+    return 0;
+
+  return (gint)lrint(cbrt((double) v) * VOLUME_NORM);
+}
+
+static inline float
+step_to_spa_volume(gint step)
+{
+  double n = (double) step / VOLUME_NORM;
+
+  return (float)(n * n * n);
+}
+
+/* Pull the level out of a SPA_PARAM_Props pod.
+ *
+ * channelVolumes, not volume.  The node's `volume` is a master gain that
+ * multiplies on top of the per-channel values (channelmix_set_volume in
+ * audioconvert) and pipewire-pulse never touches it:
+ * set_node_volume_mute() writes SPA_PROP_channelVolumes, and that is what
+ * pactl reports and what wireplumber persists for the route.  Reading
+ * `volume` here would pin the slider at 0 dB no matter where the sink
+ * actually is. */
+static gboolean
+read_pod_volume(const struct spa_pod *param, gint *volume_out)
+{
+  const struct spa_pod_object *obj = (const struct spa_pod_object *) param;
+  const struct spa_pod_prop *prop;
+  float lin[1] = { 0.0f };
+
+  if (!param)
+    return FALSE;
+
+  prop = spa_pod_object_find_prop(obj, NULL, SPA_PROP_channelVolumes);
+  if (!prop)
+    return FALSE;
+
+  /* An array, not &scalar: the macro expands sizeof(values[0]) without
+   * parenthesising, so &lin[0] reads as &(lin[0]) and subscripts a
+   * float. */
+  if (spa_pod_copy_array(&prop->value, SPA_TYPE_Float, lin, 1) < 1)
+    return FALSE;
+
+  *volume_out = spa_volume_to_step(lin[0]);
+  return TRUE;
+}
+
+/* Build the Props pod that sets every channel to one level, which is what
+ * pa_cvolume_set() did on the PulseAudio side.  Balance is not preserved,
+ * same as before -- the applet has never had a balance control. */
+static struct spa_pod *
+build_volume_pod(struct spa_pod_builder *b, gint volume, uint32_t n_channels)
+{
+  float vals[SPA_AUDIO_MAX_CHANNELS];
+  float lin = step_to_spa_volume(volume);
+  uint32_t i;
+
+  for (i = 0; i < n_channels; i++)
+    vals[i] = lin;
+
+  return spa_pod_builder_add_object(b,
+           SPA_TYPE_OBJECT_Props, SPA_PARAM_Props,
+           SPA_PROP_channelVolumes,
+             SPA_POD_Array(sizeof(float), SPA_TYPE_Float, n_channels, vals));
+}
 
 #define SOUND_STATUS_MENU_TYPE_ITEM (sounds_status_menu_item_get_type())
 #define SOUND_STATUS_MENU_ITEM(obj) \
@@ -97,11 +220,57 @@ struct _SoundsStatusMenuItemPrivate
   GtkWidget *hscale;
   GtkWidget *image;
   gulong hscale_value_changed_id;
-  pa_context *pa_context;
-  pa_glib_mainloop *pa_loop;
-  /* Level of the sink we track.  There is one cached level because there is
-   * one tracked sink; call vs media is a choice of ladder, not a stored
-   * value. */
+  /* Transport.  PipeWire owns its own loop but not its own thread: the
+   * loop's epoll fd is watched by GLib and drained with
+   * pw_loop_iterate(loop, false), so registry callbacks, the X key grabs
+   * and the MCE D-Bus filter all run on the one GTK thread and no
+   * marshalling between event sources is needed. */
+  struct pw_main_loop *pw_loop;
+  GSource *pw_bridge;
+  GIOChannel *pw_channel;
+  struct pw_context *pw_context;
+  struct pw_core *pw_core;
+  struct spa_hook pw_core_hook;
+  struct pw_registry *pw_registry;
+  struct spa_hook pw_registry_hook;
+  struct pw_metadata *pw_metadata;
+  struct spa_hook pw_metadata_hook;
+  /* Proxy for the sink we track, plus its id so a registry removal can be
+   * recognised.  have_sink_props / have_sink_volume say which halves of
+   * the picture have landed: properties arrive on node.info, the level on
+   * the SPA_PARAM_Props param, and the slider needs both. */
+  struct pw_proxy *sink_proxy;
+  struct spa_hook sink_hook;
+  uint32_t sink_id;
+  gboolean have_sink_props;
+  gboolean have_sink_volume;
+  /* The user's target for this output, and what the slider draws.  Kept
+   * apart from `volume` because during a call the slider rides the call
+   * stream while the media target stays put underneath it. */
+  gint target;
+  gboolean have_target;
+
+  /* A level that arrived before the ladder to map it onto. The ladder
+   * and the level come on separate channels and either can win the race;
+   * rather than drop the level or re-run the sync on every unrelated
+   * event, the request is parked here and replayed when the ladder is
+   * installed. */
+  gboolean deferred_state_sync;
+  /* Last value seen for the default.audio.sink metadata entry, kept so a
+   * sink removal can re-point without another round trip. */
+  gchar *default_sink_name;
+  /* Every sink the registry has announced, name -> node id.  A global is
+   * announced once and cannot be re-requested, so the map is what lets a
+   * later resolve_sink() find a sink that showed up before we knew its
+   * name. */
+  GHashTable *sink_ids;
+  guint32 sync_seq;
+  guint reconnect_id;
+  /* The level of the sink we track, straight off SPA_PARAM_Props.  Kept
+   * apart from `volume` because during a call the slider rides the call
+   * stream and a sink event must not overwrite that. */
+  gint sink_volume;
+  /* Level the slider shows, and the level writes are made from. */
   int volume;
   gdouble range_val;
   /* TRUE while at least one sink input carries media.role=phone.  Replaces
@@ -111,11 +280,10 @@ struct _SoundsStatusMenuItemPrivate
   gboolean call_active;
   /* Accumulator for the in-progress sink input scan. */
   gboolean call_active_pending;
-  /* First call-role stream found by the scan.  While a call is active the
-   * slider reads from and writes to this stream instead of the sink, which
-   * is what keeps media and VOIP volume independent. */
-  uint32_t call_input_index;
-  int call_input_volume;
+  /* Every live call-role stream, keyed by node id.  While a call is
+   * active the slider reads from and writes to these instead of the sink,
+   * which is what keeps media and VOIP volume independent. */
+  GHashTable *call_streams;
   gboolean portrait;
   guint8 normal_channels;
   gchar *normal_sink_name;
@@ -130,8 +298,6 @@ struct _SoundsStatusMenuItemPrivate
   GQuark quark_incall;
   gboolean warned_normal_tuning;
   gboolean warned_incall_tuning;
-  pa_mainloop_api *pa_api;
-  pa_operation *pa_operation;
   gboolean parent_signals_connected;
   gboolean parent_window_mapped;
   guint mm_key;
@@ -169,20 +335,36 @@ HD_DEFINE_PLUGIN_MODULE_EXTENDED(SoundsStatusMenuItem,
 static void
 reconnect(SoundsStatusMenuItem *menu_item);
 static void
-prop_sink_info_cb(pa_context *c, const pa_sink_info *i, int eol,
-                  void *userdata);
+schedule_reconnect(SoundsStatusMenuItem *menu_item);
 static void
-context_get_server_info_cb(pa_context *c,
-                           const pa_server_info *i,
-                           void *userdata);
+read_sink_volume(SoundsStatusMenuItem *menu_item);
+static void
+sink_state_changed(SoundsStatusMenuItem *menu_item, const char *why);
+static void
+bind_sink(SoundsStatusMenuItem *menu_item, uint32_t id);
+static void
+write_target(SoundsStatusMenuItem *menu_item, gint volume);
+static void
+clear_sink(SoundsStatusMenuItem *menu_item);
+static void
+follow_default_sink(SoundsStatusMenuItem *menu_item);
+static void
+resolve_sink(SoundsStatusMenuItem *menu_item);
+static void
+teardown_connection(SoundsStatusMenuItem *menu_item);
+static void
+call_state_changed(SoundsStatusMenuItem *menu_item);
 static void
 set_volume(SoundsStatusMenuItem *menu_item, int volume);
 static gboolean
-get_normal_sink_info(SoundsStatusMenuItem *menu_item,
-                      SoundsStatusMenuItemPrivate *priv);
-static gboolean
 parse_tuning_property(const gchar *property, gint *num_steps_out,
                       gint **steps_out, GQuark *quark);
+static void
+clear_tuning(gint *num_steps_out, gint **steps_out, GQuark *quark);
+static gboolean
+have_ladder(SoundsStatusMenuItemPrivate *priv);
+static void
+sync_slider_sensitivity(SoundsStatusMenuItem *menu_item);
 
 static void
 sounds_status_menu_item_class_finalize(SoundsStatusMenuItemClass *klass)
@@ -420,6 +602,11 @@ update_slider(SoundsStatusMenuItem *menu_item)
   SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
   double val;
 
+  /* No ladder yet means no mapping to draw from. The control is
+   * insensitive in this state; leave it where it is. */
+  if (!have_ladder(priv))
+    return;
+
   if (priv->call_active)
   {
     val = pa_vol_to_slider(priv->volume, priv->incall_volume_steps,
@@ -455,22 +642,14 @@ dbus_filter(DBusConnection *connection, DBusMessage *message, void *user_data)
                               DBUS_TYPE_INT32, &value,
                               DBUS_TYPE_INVALID))
     {
-      if (priv->keys_are_grabbed &&
+          if (priv->keys_are_grabbed &&
           !priv->volume_changed &&
           ((hw_keycode == HW_KEYCODE_UP) || (hw_keycode == HW_KEYCODE_DOWN)) &&
           value)
       {
-        pa_operation *o;
-
         priv->mm_key =
           (hw_keycode == HW_KEYCODE_UP ? X_KEYCODE_UP : X_KEYCODE_DOWN);
-        o = pa_context_get_sink_info_by_name(priv->pa_context,
-                                             priv->normal_sink_name,
-                                             prop_sink_info_cb,
-                                             menu_item);
-
-        if (o)
-          pa_operation_unref(o);
+        read_sink_volume(menu_item);
       }
     }
     else if (error.message)
@@ -518,20 +697,44 @@ sounds_status_menu_item_dispose(GObject *object)
 
   gdk_window_remove_filter(0, gdk_filter_func, menu_item);
 
-  if (priv->pa_context)
+  if (priv->reconnect_id)
   {
-    pa_context_set_subscribe_callback(priv->pa_context, NULL, NULL);
-    pa_context_set_state_callback(priv->pa_context, NULL, NULL);
-    pa_context_disconnect(priv->pa_context);
-    pa_context_unref(priv->pa_context);
-    priv->pa_context = NULL;
+    g_source_remove(priv->reconnect_id);
+    priv->reconnect_id = 0;
   }
 
-  if (priv->pa_loop)
+  teardown_connection(menu_item);
+
+  if (priv->pw_bridge)
   {
-    pa_glib_mainloop_free(priv->pa_loop);
-    priv->pa_loop = NULL;
-    priv->pa_api = NULL;
+    g_source_destroy(priv->pw_bridge);
+    g_source_unref(priv->pw_bridge);
+    priv->pw_bridge = NULL;
+  }
+
+  if (priv->pw_channel)
+  {
+    g_io_channel_unref(priv->pw_channel);
+    priv->pw_channel = NULL;
+  }
+
+  if (priv->pw_loop)
+  {
+    pw_main_loop_destroy(priv->pw_loop);
+    priv->pw_loop = NULL;
+    pw_deinit();
+  }
+
+  if (priv->call_streams)
+  {
+    g_hash_table_destroy(priv->call_streams);
+    priv->call_streams = NULL;
+  }
+
+  if (priv->sink_ids)
+  {
+    g_hash_table_destroy(priv->sink_ids);
+    priv->sink_ids = NULL;
   }
 
   g_signal_handler_disconnect(gdk_screen_get_default(), priv->size_changed_id);
@@ -540,12 +743,6 @@ sounds_status_menu_item_dispose(GObject *object)
   {
     dbus_connection_remove_filter(dbus_g_connection_get_connection(priv->dbus),
                                   dbus_filter, menu_item);
-  }
-
-  if (priv->pa_operation)
-  {
-    pa_operation_unref(priv->pa_operation);
-    priv->pa_operation = NULL;
   }
 
   if (priv->icon)
@@ -595,24 +792,31 @@ get_sinks(SoundsStatusMenuItemPrivate *priv)
     priv->normal_sink_property =
       g_key_file_get_string(key_file, "normal", "sink_property", &error);
 
-    if (error)
+    /* A missing key means the convention, not "no ladder". These are
+     * the keys the audio stack publishes the ladders under, so the
+     * applet reads them even when sinks.ini says nothing -- otherwise a
+     * bare or stale config file takes the volume control down over
+     * what is only an absent override. */
+    if (!priv->normal_sink_property || !*priv->normal_sink_property)
     {
-      g_warning("VOLUME: unable to get normal->sink_property [%s]",
-                error->message);
-      g_error_free(error);
-      error = NULL;
+      g_free(priv->normal_sink_property);
+      priv->normal_sink_property = g_strdup(TUNING_KEY);
     }
+
+    if (error)
+      g_error_free(error);
 
     priv->incall_sink_property =
       g_key_file_get_string(key_file, "incall", "sink_property", &error);
 
-    if (error)
+    if (!priv->incall_sink_property || !*priv->incall_sink_property)
     {
-      g_warning("VOLUME: unable to get incall->sink_property [%s]",
-                error->message);
-      g_error_free(error);
-      error = NULL;
+      g_free(priv->incall_sink_property);
+      priv->incall_sink_property = g_strdup(TUNING_INCALL_KEY);
     }
+
+    if (error)
+      g_error_free(error);
 
     priv->swap_on_rotate =
       g_key_file_get_boolean(key_file, "behavior", "swap_on_rotate", NULL);
@@ -623,17 +827,45 @@ get_sinks(SoundsStatusMenuItemPrivate *priv)
   g_key_file_free(key_file);
 }
 
-/* Seed both tables at startup. The slider can be moved before the first
- * sink info arrives and slider_to_pa_vol() asserts on a NULL table, so
- * they must never be left unset. prop_sink_info_cb() replaces these with
- * the device's real ladders as soon as it reads them. */
-static void
-apply_default_tuning(SoundsStatusMenuItemPrivate *priv)
+/* Whether the table for the mode we are in can be mapped against.
+ *
+ * The ladder comes from the sink node, so between startup and the first
+ * sink info -- and for a sink that publishes nothing -- there is none.
+ * There is nothing to map a slider position to in that state, and a
+ * write made from it would land on a level derived from nothing. The
+ * slider is made insensitive and the volume keys are ignored instead of
+ * substituting a curve.
+ *
+ * num_steps > 1 because a single entry cannot express a range. */
+static gboolean
+have_ladder(SoundsStatusMenuItemPrivate *priv)
 {
-  parse_tuning_property(DEFAULT_NORMAL_TUNING, &priv->normal_volume_num_steps,
-                        &priv->normal_volume_steps, &priv->quark_normal);
-  parse_tuning_property(DEFAULT_INCALL_TUNING, &priv->incall_volume_num_steps,
-                        &priv->incall_volume_steps, &priv->quark_incall);
+  gint         n = priv->call_active ? priv->incall_volume_num_steps
+                                    : priv->normal_volume_num_steps;
+  gint      *tbl = priv->call_active ? priv->incall_volume_steps
+                                    : priv->normal_volume_steps;
+
+  return tbl != NULL && n > 1;
+}
+
+/* Reflect the ladder into the control. Called wherever the ladder is
+ * installed or lost, so the widget never offers a gesture the applet
+ * would have to discard. */
+static void
+sync_slider_sensitivity(SoundsStatusMenuItem *menu_item)
+{
+  SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
+  gboolean usable = have_ladder(priv);
+
+  if (priv->hscale && gtk_widget_is_sensitive(priv->hscale) != usable)
+    gtk_widget_set_sensitive(priv->hscale, usable);
+
+  /* A level may have been parked waiting for exactly this. */
+  if (usable && priv->deferred_state_sync)
+  {
+    priv->deferred_state_sync = FALSE;
+    sink_state_changed(menu_item, "usable");
+  }
 }
 
 static void
@@ -680,281 +912,621 @@ is_call_media_role(const char *role)
   return FALSE;
 }
 
-/* Is any sink input carrying a call?
+/* Call streams
  *
- * The role is the marker.  Nothing on Leste sets a call role by default
- * yet; a wireplumber rule keyed on application.process.binary is the
- * intended producer.  What matters here is that the answer comes from a
- * queryable list rather than an edge-triggered signal, so the applet can
- * ask at any point -- including immediately after starting up mid-call.
+ * The in-call state comes from the stream list, not from an edge signal
+ * out of MCE: the list is queryable at any moment, so an applet that
+ * starts up during a call sees the truth instead of having missed a
+ * transition it was not listening for.
  *
- * A circuit-switched call has no host stream at all: the modem drives the
- * codec directly through the UCM Voice Call verb, and the call node is a
- * separate sink whose own ladder already is the call ladder.  This check
- * exists so that a VOIP stream played through a *media* sink gets that
- * sink's in-call ladder instead of the media one.
+ * Whether a circuit-switched call exposes a host stream at all is a
+ * property of the device, not something this plugin can assume.  On
+ * mapphone the modem drives the codec directly through the UCM Voice
+ * Call verb and there is nothing for the CPU to touch; on N900 the stream
+ * is reachable; elsewhere we simply do not know.  The asymmetry costs
+ * nothing here: a call stream that exists gets the in-call ladder, one
+ * that does not leaves the sink ladder in charge, and both are the same
+ * code path.
  */
-static void
-call_state_scan_cb(pa_context *c, const pa_sink_input_info *i, int eol,
-                  void *userdata)
+struct call_stream
 {
-  SoundsStatusMenuItem *menu_item = userdata;
-  SoundsStatusMenuItemPrivate *priv;
+  SoundsStatusMenuItem *menu_item;
+  uint32_t id;
+  struct pw_proxy *proxy;
+  struct spa_hook hook;
+  gint volume;
+  uint32_t channels;
+  gboolean have_volume;
+};
 
-  (void)c;
-  g_assert(menu_item);
+static void
+call_stream_free(gpointer data)
+{
+  struct call_stream *cs = data;
 
-  priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
+  if (cs && cs->proxy)
+    pw_proxy_destroy(cs->proxy);
 
-  if (eol < 0)
+  g_free(cs);
+}
+
+/* The stream whose level feeds the slider.  Prefer one that has actually
+ * reported a volume, so a second call stream that is still being set up
+ * cannot stall the display. */
+static struct call_stream *
+first_call_stream(SoundsStatusMenuItemPrivate *priv)
+{
+  GHashTableIter iter;
+  gpointer value;
+  struct call_stream *first = NULL;
+
+  if (!priv->call_streams)
+    return NULL;
+
+  g_hash_table_iter_init(&iter, priv->call_streams);
+  while (g_hash_table_iter_next(&iter, NULL, &value))
   {
-    g_warning("VOLUME: sink input enumeration failed: %s",
-              pa_strerror(pa_context_errno(c)));
-    return;
+    struct call_stream *cs = value;
+
+    if (!first)
+      first = cs;
+
+    if (cs->have_volume)
+      return cs;
   }
 
-  if (eol > 0)
-  {
-    gboolean changed = priv->call_active != priv->call_active_pending;
-
-    priv->call_active = priv->call_active_pending;
-
-    if (changed)
-      g_debug("VOLUME: call state is now %s",
-              priv->call_active ? "active" : "idle");
-
-    if (priv->call_active)
-    {
-      if (priv->call_input_index == PA_INVALID_INDEX)
-        return;
-
-      if (changed || priv->volume != priv->call_input_volume)
-      {
-        /* The slider now rides the call stream rather than the sink.
-         * Leaving the sink alone is the whole point: media volume keeps
-         * whatever the user left there, and the call gets its own level,
-         * which wireplumber then persists under media.role. */
-        priv->volume = priv->call_input_volume;
-        update_slider(menu_item);
-      }
-    }
-    else if (changed)
-    {
-      /* Call over.  Hand the slider back to the sink we deliberately did
-       * not touch during the call. */
-      get_normal_sink_info(menu_item, priv);
-    }
-
-    return;
-  }
-
-  if (!i)
-    return;
-
-  if (is_call_media_role(pa_proplist_gets(i->proplist, PA_PROP_MEDIA_ROLE)))
-  {
-    priv->call_active_pending = TRUE;
-
-    if (priv->call_input_index == PA_INVALID_INDEX && i->volume.channels > 0)
-    {
-      priv->call_input_index = i->index;
-      priv->call_input_volume = i->volume.values[0];
-    }
-  }
+  return first;
 }
 
 static void
-update_call_state(SoundsStatusMenuItem *menu_item)
+call_state_changed(SoundsStatusMenuItem *menu_item)
 {
   SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
-  pa_operation *o;
+  gboolean now_active;
+  gboolean changed;
+  struct call_stream *cs;
 
-  if (!priv->pa_context)
+  now_active = priv->call_streams &&
+                 g_hash_table_size(priv->call_streams) > 0;
+  changed = priv->call_active != now_active;
+  priv->call_active = now_active;
+
+  if (!now_active)
+  {
+    if (changed)
+    {
+      g_debug("VOLUME: call state is now idle");
+      /* Call over.  Put the slider back on the media target that was left
+       * alone for the duration; if nothing ever published one, read the
+       * sink so the seed path can adopt the route level. */
+      if (priv->have_target)
+      {
+        priv->volume = priv->target;
+        update_slider(menu_item);
+      }
+      else
+        read_sink_volume(menu_item);
+    }
+    return;
+  }
+
+  if (changed)
+    g_debug("VOLUME: call state is now active");
+
+  cs = first_call_stream(priv);
+
+  /* Active but nothing has reported a level yet: leave the display alone
+   * rather than draw a number we do not have. */
+  if (!cs || !cs->have_volume)
     return;
 
-  priv->call_active_pending = FALSE;
-  priv->call_input_index = PA_INVALID_INDEX;
-  priv->call_input_volume = 0;
-
-  o = pa_context_get_sink_input_info_list(priv->pa_context,
-                                          call_state_scan_cb, menu_item);
-  if (o)
-    pa_operation_unref(o);
+  if (changed || priv->volume != cs->volume)
+  {
+    /* The slider rides the call stream rather than the sink.  Leaving the
+     * sink alone is the whole point: media keeps whatever level the user
+     * left there while the call gets its own. */
+    priv->volume = cs->volume;
+    update_slider(menu_item);
+  }
 }
+
+static void
+call_node_info(void *data, const struct pw_node_info *info)
+{
+  struct call_stream *cs = data;
+
+  /* A playback stream feeds the sink through its output ports, so that is
+   * the channel count the write has to match. */
+  if (info->n_output_ports > 0 && info->n_output_ports <= SPA_AUDIO_MAX_CHANNELS)
+    cs->channels = info->n_output_ports;
+}
+
+static void
+call_node_param(void *data, int seq, uint32_t id, uint32_t index,
+                 uint32_t next, const struct spa_pod *param)
+{
+  struct call_stream *cs = data;
+
+  (void) seq;
+  (void) index;
+  (void) next;
+
+  if (id != SPA_PARAM_Props)
+    return;
+
+  if (read_pod_volume(param, &cs->volume))
+    cs->have_volume = TRUE;
+
+  call_state_changed(cs->menu_item);
+}
+
+static const struct pw_node_events call_node_events = {
+  PW_VERSION_NODE_EVENTS,
+  .info = call_node_info,
+  .param = call_node_param,
+};
+
+static void
+track_call_stream(SoundsStatusMenuItem *menu_item, uint32_t id)
+{
+  SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
+  struct call_stream *cs;
+  uint32_t props[] = { SPA_PARAM_Props };
+
+  if (!priv->call_streams ||
+      g_hash_table_contains(priv->call_streams, GUINT_TO_POINTER(id)))
+    return;
+
+  cs = g_new0(struct call_stream, 1);
+  cs->menu_item = menu_item;
+  cs->id = id;
+  cs->proxy = pw_registry_bind(priv->pw_registry, id, PW_TYPE_INTERFACE_Node,
+                                PW_VERSION_NODE, 0);
+  if (!cs->proxy)
+  {
+    g_warning("VOLUME: failed to bind call stream %u", id);
+    g_free(cs);
+    return;
+  }
+
+  pw_proxy_add_object_listener(cs->proxy, &cs->hook, &call_node_events, cs);
+
+  /* Subscribe before asking for the current value, so a change landing
+   * between the two cannot be missed. */
+  pw_node_subscribe_params((struct pw_node *) cs->proxy, props, 1);
+  pw_node_enum_params((struct pw_node *) cs->proxy, 0, SPA_PARAM_Props,
+                      0, UINT32_MAX, NULL);
+
+  g_hash_table_insert(priv->call_streams, GUINT_TO_POINTER(id), cs);
+
+  call_state_changed(menu_item);
+}
+
+static void
+untrack_call_stream(SoundsStatusMenuItem *menu_item, uint32_t id)
+{
+  SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
+
+  if (priv->call_streams &&
+      g_hash_table_remove(priv->call_streams, GUINT_TO_POINTER(id)))
+    call_state_changed(menu_item);
+}
+
+/* The default sink is a metadata entry rather than a field of a server
+ * record: "default.audio.sink" on the core object, whose value is a JSON
+ * string carrying the node name. */
+static gboolean
+default_sink_name_from_json(const char *json, gchar **out)
+{
+  struct spa_json doc;
+  struct spa_json obj;
+  char key[64];
+  char val[512];
+
+  if (!json)
+    return FALSE;
+
+  spa_json_init(&doc, json, strlen(json));
+
+  if (spa_json_enter_object(&doc, &obj) <= 0)
+    return FALSE;
+
+  /* Keys and values alternate, so every value we do not want still has to
+   * be consumed to reach the next key. */
+  while (spa_json_get_string(&obj, key, sizeof(key)) > 0)
+  {
+    if (g_strcmp0(key, "name") == 0)
+    {
+      if (spa_json_get_string(&obj, val, sizeof(val)) <= 0)
+        return FALSE;
+
+      g_free(*out);
+      *out = g_strdup(val);
+      return TRUE;
+    }
+
+    if (spa_json_get_string(&obj, val, sizeof(val)) <= 0)
+      return FALSE;
+  }
+
+  return FALSE;
+}
+
+/* Take a level for the sink we are tracking and put it to work.
+ *
+ * Split out because it has two callers arriving from different
+ * directions: the metadata callback when the key changes, and the sink
+ * bind when a level that was already there turns out to be aimed at us. */
+static int
+apply_target(SoundsStatusMenuItem *menu_item, const gchar *value)
+{
+  SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
+  gchar *end = NULL;
+  gint64 n;
+
+  if (!value)
+  {
+    priv->have_target = FALSE;
+    return 0;
+  }
+
+  n = g_ascii_strtoll(value, &end, 10);
+  if (!end || end == value || *end != '\0')
+  {
+    g_warning("VOLUME: %s on %s is not a number: '%s'", TARGET_KEY,
+              priv->normal_sink_name ? priv->normal_sink_name : "(null)",
+              value);
+    return -EINVAL;
+  }
+
+  if (priv->have_target && priv->target == (gint) n)
+    return 0;        /* the same level arriving again; nothing to redo */
+
+  g_debug("VOLUME: target for %s is now %lld",
+          priv->normal_sink_name ? priv->normal_sink_name : "(null)",
+          (long long) n);
+
+  priv->target = (gint) n;
+  priv->have_target = TRUE;
+
+  /* During a call the slider belongs to the stream; the target is still
+   * recorded so the end of the call can put it back. */
+  if (!priv->call_active)
+    sink_state_changed(menu_item, "target");
+
+  return 0;
+}
+
+static int
+metadata_property(void *data, uint32_t subject, const char *key,
+                   const char *type, const char *value)
+{
+  SoundsStatusMenuItem *menu_item = data;
+  SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
+
+  (void) type;
+
+  /* The target is a per-output value and the applet is the only writer of
+   * it in metadata: this is the outbound half of the channel, from the
+   * slider to the module. The level comes back the other way as a
+   * property of the sink node, read in sink_info_cb(), where it arrives
+   * together with the ladder that gives it meaning. So the echo of our
+   * own write is not something to act on. */
+  if (g_strcmp0(key, TARGET_KEY) == 0)
+    return 0;
+
+  if (subject != PW_ID_CORE || g_strcmp0(key, "default.audio.sink") != 0)
+    return 0;
+
+  if (!default_sink_name_from_json(value, &priv->default_sink_name))
+  {
+    g_warning("VOLUME: cannot read a sink name from '%s'", value ? value : "");
+    return -EINVAL;
+  }
+
+  g_debug("VOLUME: default sink is now %s", priv->default_sink_name);
+
+  follow_default_sink(menu_item);
+
+  return 0;
+}
+
+static const struct pw_metadata_events metadata_events = {
+  PW_VERSION_METADATA_EVENTS,
+  .property = metadata_property,
+};
 
 static void
 follow_default_sink(SoundsStatusMenuItem *menu_item)
 {
   SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
-  pa_operation *o;
 
-  /* A sink explicitly named in sinks.ini wins and is never replaced by the
-   * server default. */
+  /* A sink named in sinks.ini wins and is never replaced by the default. */
   if (priv->normal_sink_name_provided)
     return;
 
-  o = pa_context_get_server_info(priv->pa_context,
-                                  context_get_server_info_cb, menu_item);
+  if (!priv->default_sink_name)
+    return;
 
-  if (o)
-    pa_operation_unref(o);
-  else
-    g_warning("VOLUME: failed to create get_server_info operation: %s",
-              pa_strerror(pa_context_errno(priv->pa_context)));
+  /* Only skip when we are actually still bound.  Comparing names alone is
+   * not enough: after the bound sink disappears -- a profile switch, or a
+   * node recreated under the same name with a new id -- the names still
+   * match while sink_proxy is gone, and returning here left the applet
+   * with no proxy at all until some unrelated event happened to call
+   * resolve_sink().  The add path normally covers it, but that depends on
+   * the new node being announced after the old one is removed; an
+   * overlapping swap slipped through. */
+  if (priv->sink_proxy &&
+      priv->normal_sink_name &&
+      g_str_equal(priv->normal_sink_name, priv->default_sink_name))
+    return;
+
+  g_free(priv->normal_sink_name);
+  priv->normal_sink_name = g_strdup(priv->default_sink_name);
+
+  resolve_sink(menu_item);
 }
 
 static void
-context_subscribe_cb(pa_context *c, pa_subscription_event_type_t t,
-                     uint32_t idx, void *userdata)
+registry_global(void *data, uint32_t id, uint32_t permissions,
+                 const char *type, uint32_t version,
+                 const struct spa_dict *props)
 {
-  SoundsStatusMenuItem *menu_item = userdata;
+  SoundsStatusMenuItem *menu_item = data;
   SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
-  pa_subscription_event_type_t facility =
-    t & PA_SUBSCRIPTION_EVENT_FACILITY_MASK;
-  pa_subscription_event_type_t type = t & PA_SUBSCRIPTION_EVENT_TYPE_MASK;
+  const char *media_class;
 
-  /* t is a combination of a facility and an event type, so it has to be
-   * masked before comparing. The previous "t == PA_SUBSCRIPTION_EVENT_CHANGE"
-   * style only ever matched SINK|CHANGE, and "t == PA_SUBSCRIPTION_EVENT_SINK"
-   * only matched SINK|NEW (both constants are 0), so sink removals and
-   * default-sink switches were invisible. */
-  switch (facility)
+  (void) permissions;
+  (void) version;
+
+  if (g_strcmp0(type, PW_TYPE_INTERFACE_Metadata) == 0)
   {
-    case PA_SUBSCRIPTION_EVENT_SINK:
-      if (type == PA_SUBSCRIPTION_EVENT_REMOVE)
-        follow_default_sink(menu_item);
-      else
-        get_normal_sink_info(menu_item, priv);
-      break;
+    if (priv->pw_metadata)
+      return;
 
-    case PA_SUBSCRIPTION_EVENT_SERVER:
-      follow_default_sink(menu_item);
-      break;
+    if (g_strcmp0(props ? spa_dict_lookup(props, "metadata.name") : NULL,
+                   "default") != 0)
+      return;
 
-    case PA_SUBSCRIPTION_EVENT_SINK_INPUT:
-      /* A stream appearing or disappearing can start or end a call as far
-       * as this applet is concerned. */
-      update_call_state(menu_item);
-      break;
+    priv->pw_metadata = (struct pw_metadata *) pw_registry_bind(
+                          priv->pw_registry, id, PW_TYPE_INTERFACE_Metadata,
+                          PW_VERSION_METADATA, 0);
+    if (!priv->pw_metadata)
+    {
+      g_warning("VOLUME: failed to bind the default metadata object");
+      return;
+    }
 
-    default:
-      break;
-  }
-}
-
-static void
-pa_subscribe_events(pa_context *c)
-{
-  pa_operation *o;
-
-  /* No SOURCE mask: nothing in this plugin reads sources, and taking the
-   * mask only wakes us to fall straight through the switch. */
-  o = pa_context_subscribe(c,
-                           PA_SUBSCRIPTION_MASK_SINK|
-                           PA_SUBSCRIPTION_MASK_SERVER|
-                           PA_SUBSCRIPTION_MASK_SINK_INPUT,
-                           NULL,
-                           NULL);
-
-  if (o)
-    pa_operation_unref(o);
-}
-
-static gboolean
-get_normal_sink_info(SoundsStatusMenuItem *menu_item,
-                     SoundsStatusMenuItemPrivate *priv)
-{
-  pa_operation *o;
-
-  o = pa_context_get_sink_info_by_name(priv->pa_context, priv->normal_sink_name,
-                                       prop_sink_info_cb, menu_item);
-
-  if (o)
-  {
-    pa_operation_unref(o);
-    return TRUE;
-  }
-
-  g_warning("VOLUME: Pulse audio failure: %s %s",
-            pa_strerror(pa_context_errno(priv->pa_context)),
-            priv->normal_sink_name);
-
-  return FALSE;
-}
-
-static void
-context_get_server_info_cb(pa_context *c, const pa_server_info *i,
-                           void *userdata)
-{
-  SoundsStatusMenuItem *menu_item = userdata;
-  SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
-
-  if (!i)
-  {
-    g_warning("VOLUME: unable to get server info / default sink name: %s",
-              pa_strerror(pa_context_errno(c)));
+    pw_metadata_add_listener(priv->pw_metadata, &priv->pw_metadata_hook,
+                             &metadata_events, menu_item);
     return;
   }
 
-  if (priv->normal_sink_name)
+  if (g_strcmp0(type, PW_TYPE_INTERFACE_Node) != 0)
+    return;
+
+  media_class = props ? spa_dict_lookup(props, PW_KEY_MEDIA_CLASS) : NULL;
+  if (!media_class)
+    return;
+
+  if (g_strcmp0(media_class, "Audio/Sink") == 0)
   {
-    g_free(priv->normal_sink_name);
-    priv->normal_sink_name = NULL;
+    const char *name = spa_dict_lookup(props, PW_KEY_NODE_NAME);
+
+    if (!name)
+      return;
+
+    /* Remember every sink we are told about.  The registry announces a
+     * global once and there is no way to ask for the list again short of
+     * tearing the registry down, so the names have to be kept on the
+     * client side for a later resolve_sink(). */
+    if (priv->sink_ids)
+      g_hash_table_replace(priv->sink_ids, g_strdup(name),
+                           GUINT_TO_POINTER(id));
+
+    if (priv->normal_sink_name && g_str_equal(name, priv->normal_sink_name))
+      bind_sink(menu_item, id);
+    return;
   }
 
-  priv->normal_sink_name = g_strdup(i->default_sink_name);
-  get_normal_sink_info(menu_item, priv);
+  if (g_strcmp0(media_class, "Stream/Output/Audio") == 0)
+  {
+    if (is_call_media_role(spa_dict_lookup(props, PW_KEY_MEDIA_ROLE)))
+      track_call_stream(menu_item, id);
+    return;
+  }
 }
 
 static void
-context_state_callback(pa_context *c, void *userdata)
+forget_sink_id(SoundsStatusMenuItemPrivate *priv, uint32_t id)
 {
-  SoundsStatusMenuItem *menu_item = userdata;
-  SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
-  pa_context_state_t state;
+  GHashTableIter iter;
+  gpointer key;
+  gpointer value;
 
-  g_assert(c);
-  g_assert(menu_item);
+  if (!priv->sink_ids)
+    return;
 
-  state = pa_context_get_state(c);
-
-  if ((state == PA_CONTEXT_READY) || (state == PA_CONTEXT_FAILED) ||
-      (state == PA_CONTEXT_TERMINATED))
+  g_hash_table_iter_init(&iter, priv->sink_ids);
+  while (g_hash_table_iter_next(&iter, &key, &value))
   {
-    if (state == PA_CONTEXT_READY)
+    if ((uint32_t) GPOINTER_TO_UINT(value) == id)
     {
-      pa_operation *o;
-
-      pa_context_set_subscribe_callback(c, context_subscribe_cb, menu_item);
-      pa_subscribe_events(c);
-
-      /* Prime the call state before the first draw, so a start-up during a
-       * VOIP call lands on the in-call ladder. */
-      update_call_state(menu_item);
-
-      if (priv->normal_sink_name_provided)
-      {
-        if (!get_normal_sink_info(menu_item, priv))
-          priv->normal_sink_name_provided = FALSE;
-      }
-
-      if (!priv->normal_sink_name_provided)
-      {
-        o = pa_context_get_server_info(priv->pa_context,
-                                       context_get_server_info_cb, menu_item);
-
-        if (o)
-          pa_operation_unref(o);
-        else
-        {
-          g_warning("VOLUME: Failed to create get_server_info operation: %s",
-                    pa_strerror(pa_context_errno(priv->pa_context)));
-        }
-      }
+      g_hash_table_iter_remove(&iter);
+      return;
     }
-    else
-      reconnect(menu_item);
   }
+}
+
+static void
+registry_global_remove(void *data, uint32_t id)
+{
+  SoundsStatusMenuItem *menu_item = data;
+  SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
+
+  if (priv->sink_id != SPA_ID_INVALID && priv->sink_id == id)
+  {
+    /* The sink is gone, usually a UCM profile switch, which moves the
+     * default along with it.  Drop what was cached and re-follow. */
+    clear_sink(menu_item);
+    forget_sink_id(priv, id);
+    follow_default_sink(menu_item);
+    return;
+  }
+
+  forget_sink_id(priv, id);
+  untrack_call_stream(menu_item, id);
+}
+
+static const struct pw_registry_events registry_events = {
+  PW_VERSION_REGISTRY_EVENTS,
+  .global = registry_global,
+  .global_remove = registry_global_remove,
+};
+
+/* The done event closes the initial registry enumeration.  Until it
+ * fires we have not necessarily seen the sink global or the
+ * default.audio.sink metadata entry, so choosing a sink any earlier
+ * would race the daemon. */
+static void
+core_done(void *data, uint32_t id, int seq)
+{
+  SoundsStatusMenuItem *menu_item = data;
+  SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
+
+  (void) id;
+
+  if (seq != priv->sync_seq)
+    return;
+
+  g_debug("VOLUME: initial PipeWire enumeration complete");
+
+  if (priv->normal_sink_name_provided)
+  {
+    resolve_sink(menu_item);
+
+    if (!priv->sink_proxy)
+    {
+      g_warning("VOLUME: sink '%s' is not present, following the default",
+                priv->normal_sink_name ? priv->normal_sink_name : "");
+      priv->normal_sink_name_provided = FALSE;
+    }
+  }
+
+  if (!priv->normal_sink_name_provided)
+    follow_default_sink(menu_item);
+
+  /* Call streams are already tracked by the enumeration pass above; this
+   * just lands the slider on the right ladder before the first draw. */
+  call_state_changed(menu_item);
+}
+
+static void
+core_error(void *data, uint32_t id, int seq, int res, const char *message)
+{
+  SoundsStatusMenuItem *menu_item = data;
+
+  (void) id;
+  (void) seq;
+
+  g_warning("VOLUME: PipeWire core error %d (%s)", res, message ? message : "");
+
+  schedule_reconnect(menu_item);
+}
+
+static const struct pw_core_events core_events = {
+  PW_VERSION_CORE_EVENTS,
+  .done = core_done,
+  .error = core_error,
+};
+
+/* Drain PipeWire whenever its epoll fd wakes.  pw_loop_get_fd() returns
+ * the loop's real poll fd, not a wake-only pipe: IO sources, timerfds and
+ * the cross-thread control eventfd are all registered into it, and an
+ * epoll fd is itself pollable, so one GLib watch drives the whole
+ * PipeWire client on the GTK thread.  Returning TRUE keeps it armed;
+ * returning FALSE would leave the plugin deaf. */
+static gboolean
+pw_bridge_cb(GIOChannel *chan, GIOCondition cond, gpointer data)
+{
+  SoundsStatusMenuItem *menu_item = data;
+  SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
+
+  (void) chan;
+  (void) cond;
+
+  if (!priv->pw_loop)
+    return FALSE;
+
+  if (pw_loop_iterate(pw_main_loop_get_loop(priv->pw_loop), false) < 0)
+  {
+    g_warning("VOLUME: PipeWire loop error, reconnecting");
+    schedule_reconnect(menu_item);
+  }
+
+  return TRUE;
+}
+
+static void
+teardown_connection(SoundsStatusMenuItem *menu_item)
+{
+  SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
+
+  if (priv->call_streams)
+    g_hash_table_remove_all(priv->call_streams);
+
+  clear_sink(menu_item);
+
+  if (priv->pw_metadata)
+  {
+    spa_hook_remove(&priv->pw_metadata_hook);
+    pw_proxy_destroy((struct pw_proxy *) priv->pw_metadata);
+    priv->pw_metadata = NULL;
+  }
+
+  if (priv->pw_registry)
+  {
+    spa_hook_remove(&priv->pw_registry_hook);
+    pw_proxy_destroy((struct pw_proxy *) priv->pw_registry);
+    priv->pw_registry = NULL;
+  }
+
+  if (priv->pw_core)
+  {
+    spa_hook_remove(&priv->pw_core_hook);
+    pw_core_disconnect(priv->pw_core);
+    priv->pw_core = NULL;
+  }
+
+  if (priv->pw_context)
+  {
+    pw_context_destroy(priv->pw_context);
+    priv->pw_context = NULL;
+  }
+}
+
+static gboolean
+reconnect_timer(gpointer data)
+{
+  SoundsStatusMenuItem *menu_item = data;
+  SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
+
+  priv->reconnect_id = 0;
+  reconnect(menu_item);
+
+  return G_SOURCE_REMOVE;
+}
+
+static void
+schedule_reconnect(SoundsStatusMenuItem *menu_item)
+{
+  SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
+
+  if (priv->reconnect_id)
+    return;
+
+  priv->reconnect_id = g_timeout_add_seconds(RECONNECT_DELAY_SECONDS,
+                                             reconnect_timer, menu_item);
 }
 
 static void
@@ -965,23 +1537,47 @@ reconnect(SoundsStatusMenuItem *menu_item)
   g_assert(menu_item);
 
   priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
-
   g_assert(priv);
 
-  if (priv->pa_context)
-    pa_context_unref(priv->pa_context);
+  teardown_connection(menu_item);
 
-  priv->pa_context = pa_context_new(priv->pa_api, "maemo-statusmenu-volume");
-
-  pa_context_set_state_callback(priv->pa_context, context_state_callback,
-                                menu_item);
-
-  if (pa_context_connect(priv->pa_context, NULL,
-                         PA_CONTEXT_NOFAIL | PA_CONTEXT_NOAUTOSPAWN, NULL) < 0)
+  priv->pw_context = pw_context_new(pw_main_loop_get_loop(priv->pw_loop),
+                                    NULL, 0);
+  if (!priv->pw_context)
   {
-    g_warning("VOLUME: Failed to connect pa server: %s",
-              pa_strerror(pa_context_errno(priv->pa_context)));
+    g_warning("VOLUME: cannot create a PipeWire context, retrying");
+    schedule_reconnect(menu_item);
+    return;
   }
+
+  priv->pw_core = pw_context_connect(priv->pw_context, NULL, 0);
+  if (!priv->pw_core)
+  {
+    g_warning("VOLUME: cannot connect to PipeWire, retrying");
+    pw_context_destroy(priv->pw_context);
+    priv->pw_context = NULL;
+    schedule_reconnect(menu_item);
+    return;
+  }
+
+  pw_core_add_listener(priv->pw_core, &priv->pw_core_hook, &core_events,
+                       menu_item);
+
+  priv->pw_registry = pw_core_get_registry(priv->pw_core, PW_VERSION_REGISTRY,
+                                          0);
+  if (!priv->pw_registry)
+  {
+    g_warning("VOLUME: cannot get the PipeWire registry, retrying");
+    schedule_reconnect(menu_item);
+    return;
+  }
+
+  pw_registry_add_listener(priv->pw_registry, &priv->pw_registry_hook,
+                           &registry_events, menu_item);
+
+  /* Everything announced during the enumeration arrives before the done
+   * event for this sync, which is what makes it the load-complete mark. */
+  priv->sync_seq = pw_core_sync(priv->pw_core, PW_ID_CORE, 0);
 }
 
 static gint
@@ -1168,6 +1764,22 @@ expose_event_cb(GtkWidget *widget, GdkEvent *event, gpointer user_data)
   return FALSE;
 }
 
+/* Drop a table so the mode it belongs to has nothing to map against.
+ *
+ * parse_tuning_property() deliberately keeps the current table when the
+ * property is absent, which is right for a re-read of the same sink but
+ * wrong across a device change: the new sink would be mapped with the
+ * old device's curve. Absence is made explicit here so the control goes
+ * insensitive instead of going quietly wrong. */
+static void
+clear_tuning(gint *num_steps_out, gint **steps_out, GQuark *quark)
+{
+  g_free(*steps_out);
+  *steps_out = NULL;
+  *num_steps_out = 0;
+  *quark = 0;
+}
+
 static gboolean
 parse_tuning_property(const gchar *property, gint *num_steps_out,
                       gint **steps_out, GQuark *quark)
@@ -1235,7 +1847,7 @@ parse_tuning_property(const gchar *property, gint *num_steps_out,
       continue;
     }
 
-    linear = (gint) pa_sw_volume_from_dB(centibel / 100.0);
+    linear = tuning_cb_to_volume((gint)centibel);
 
     /* Both mapping functions interpolate between neighbouring entries and
      * divide by their difference, so an entry that is not strictly above
@@ -1267,76 +1879,73 @@ parse_tuning_property(const gchar *property, gint *num_steps_out,
   return TRUE;
 }
 
+/* The tracked sink.
+ *
+ * Two halves arrive on two different channels: the tuning properties and
+ * the channel count come on node.info, the level comes on the
+ * SPA_PARAM_Props param.  The slider needs both, so each half records its
+ * arrival and only the second one runs the shared tail. */
 static void
-error_callback(pa_context *c, int success, void *userdata)
+sink_info_cb(void *data, const struct pw_node_info *info)
 {
-  if (!success)
-  {
-    g_warning("VOLUME: Pulse audio failure: %s",
-              pa_strerror(pa_context_errno(c)));
-  }
-}
-
-static void
-prop_sink_info_cb(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
-{
-  SoundsStatusMenuItem *menu_item = userdata;
-  SoundsStatusMenuItemPrivate *priv;
-  gboolean volume_changed = FALSE;
+  SoundsStatusMenuItem *menu_item = data;
+  SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
+  const struct spa_dict *props;
   const char *prop_normal;
   const char *prop_incall;
-  gint volume;
-  gint steps_size;
-  gint *steps;
-  double current_vol;
-  double new_vol;
+  const char *level;
+  const char *name;
 
-  g_assert((priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item)));
+  props = info->props;
+  name = props ? spa_dict_lookup(props, PW_KEY_NODE_NAME) : NULL;
 
-  /* Track the channel count of the sink we are currently following. The
-   * previous "set only while zero" guard latched the first value it saw:
-   * after the default sink changed to a device with a different layout the
-   * applet kept writing the old channel count, and if the matching info ever
-   * arrived late the count stayed 0, which makes pa_cvolume invalid and gets
-   * the write rejected client-side (pa_context_set_sink_volume_by_name()
-   * returns NULL) so the volume silently stops changing. */
-  if (i && priv->normal_sink_name && g_str_equal(priv->normal_sink_name, i->name))
-  {
-    priv->normal_channels = i->channel_map.channels;
-  }
-
-  if (eol)
+  if (!name || !priv->normal_sink_name ||
+      !g_str_equal(name, priv->normal_sink_name))
     return;
 
+  /* The sink's input ports are where streams land, so their count is the
+   * layout width.  This has to be re-read on every info rather than latched
+   * on first sight: after the default sink changes to a device with a
+   * different layout, keeping the old count makes the write invalid and it
+   * gets rejected without any visible symptom. */
+  if (info->n_input_ports == 0 || info->n_input_ports > SPA_AUDIO_MAX_CHANNELS)
+  {
+    g_warning("VOLUME: sink %s reports %u input ports, not a usable channel "
+              "count", name, info->n_input_ports);
+    return;
+  }
+
+  priv->normal_channels = (guint8) info->n_input_ports;
+
   prop_normal = priv->normal_sink_property ?
-                  pa_proplist_gets(i->proplist, priv->normal_sink_property) :
-                  NULL;
+                  spa_dict_lookup(props, priv->normal_sink_property) : NULL;
 
   if (prop_normal)
     priv->warned_normal_tuning = FALSE;
   else
   {
     /* Say it once per sink change. A missing wireplumber rule should be
-     * visible in the log instead of silently substituting a curve that
-     * merely looks plausible. */
+     * visible in the log, and the control should stop rather than carry
+     * on against a curve that merely looks plausible. */
     if (!priv->warned_normal_tuning)
     {
       priv->warned_normal_tuning = TRUE;
-      g_warning("VOLUME: sink %s publishes no %s; using the built-in "
-                "tuning ladder",
-                i->name,
+      g_warning("VOLUME: sink %s publishes no %s; the volume control is "
+                "disabled until one appears",
+                name,
                 priv->normal_sink_property ?
                   priv->normal_sink_property : "tuning property");
     }
-    prop_normal = DEFAULT_NORMAL_TUNING;
+    clear_tuning(&priv->normal_volume_num_steps,
+                 &priv->normal_volume_steps, &priv->quark_normal);
   }
 
-  parse_tuning_property(prop_normal, &priv->normal_volume_num_steps,
-                        &priv->normal_volume_steps, &priv->quark_normal);
+  if (prop_normal)
+    parse_tuning_property(prop_normal, &priv->normal_volume_num_steps,
+                         &priv->normal_volume_steps, &priv->quark_normal);
 
   prop_incall = priv->incall_sink_property ?
-                  pa_proplist_gets(i->proplist, priv->incall_sink_property) :
-                  NULL;
+                  spa_dict_lookup(props, priv->incall_sink_property) : NULL;
 
   if (prop_incall)
     priv->warned_incall_tuning = FALSE;
@@ -1345,17 +1954,220 @@ prop_sink_info_cb(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
     if (!priv->warned_incall_tuning)
     {
       priv->warned_incall_tuning = TRUE;
-      g_warning("VOLUME: sink %s publishes no %s; using the built-in "
-                "in-call tuning ladder",
-                i->name,
+      g_warning("VOLUME: sink %s publishes no %s; the in-call volume "
+                "control is disabled until one appears",
+                name,
                 priv->incall_sink_property ?
-                  priv->incall_sink_property : "tuning property");
+                  priv->incall_sink_property : "in-call tuning property");
     }
-    prop_incall = DEFAULT_INCALL_TUNING;
+    clear_tuning(&priv->incall_volume_num_steps,
+                 &priv->incall_volume_steps, &priv->quark_incall);
   }
 
-  parse_tuning_property(prop_incall, &priv->incall_volume_num_steps,
-                        &priv->incall_volume_steps, &priv->quark_incall);
+  if (prop_incall)
+    parse_tuning_property(prop_incall, &priv->incall_volume_num_steps,
+                         &priv->incall_volume_steps, &priv->quark_incall);
+
+  priv->have_sink_props = TRUE;
+
+  /* The level this output is being driven at. It is a property of the
+   * node itself, so it arrives in the same info as the ladder -- the
+   * value and the curve that gives it meaning are never separable. That
+   * is what makes a device switch self-correcting: binding the new sink
+   * brings its level with it, on a cold start as much as on a switch,
+   * with nothing to have missed in between. */
+  level = spa_dict_lookup(props, TARGET_KEY);
+  if (level)
+    apply_target(menu_item, level);
+
+  /* The ladder has just arrived from the sink node. Bring the control up
+   * and put it where the restored level says it belongs. */
+  sync_slider_sensitivity(menu_item);
+
+  if (priv->have_sink_volume)
+    sink_state_changed(menu_item, "sink-volume");
+}
+
+static void
+sink_param_cb(void *data, int seq, uint32_t id, uint32_t index,
+               uint32_t next, const struct spa_pod *param)
+{
+  SoundsStatusMenuItem *menu_item = data;
+  SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
+
+  (void) seq;
+  (void) index;
+  (void) next;
+
+  if (id != SPA_PARAM_Props)
+    return;
+
+
+
+  priv->have_sink_volume = TRUE;
+
+  /* No seeding here.  The node mirrors the route only while the sink is
+   * running; suspended, it keeps whatever it last had.  Adopting from it
+   * would overwrite the stored per-port level with a stale number, so the
+   * policy -- which reads the route itself -- owns the initial target. */
+  if (priv->have_sink_props)
+    sink_state_changed(menu_item, "sink-props");
+}
+
+static const struct pw_node_events sink_node_events = {
+  PW_VERSION_NODE_EVENTS,
+  .info = sink_info_cb,
+  .param = sink_param_cb,
+};
+
+static void
+read_sink_volume(SoundsStatusMenuItem *menu_item)
+{
+  SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
+
+  if (!priv->sink_proxy)
+    return;
+
+  pw_node_enum_params((struct pw_node *) priv->sink_proxy, 0, SPA_PARAM_Props,
+                      0, UINT32_MAX, NULL);
+}
+
+/* Publish what the user asked for and remember it as both the target and
+ * the displayed level.  The echo through the metadata callback is what
+ * confirms it; claiming it here is what stops the seed path below from
+ * firing again on the next sink notification. */
+static void
+write_target(SoundsStatusMenuItem *menu_item, gint volume)
+{
+  SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
+  gchar text[16];
+
+  if (!priv->pw_metadata)
+  {
+    g_warning("VOLUME: no metadata object, cannot set a volume target");
+    return;
+  }
+
+  if (priv->sink_id == SPA_ID_INVALID)
+  {
+    g_warning("VOLUME: not tracking a sink, cannot set a volume target");
+    return;
+  }
+
+  g_snprintf(text, sizeof(text), "%d", volume);
+
+  if (pw_metadata_set_property(priv->pw_metadata, priv->sink_id,
+                                TARGET_KEY, "Spa:Int", text) < 0)
+  {
+    g_warning("VOLUME: failed to set a volume target on %s",
+              priv->normal_sink_name ? priv->normal_sink_name : "(null)");
+    return;
+  }
+
+  priv->target = volume;
+  priv->volume = volume;
+  priv->have_target = TRUE;
+
+  g_debug("VOLUME: target %d on %s (%u)", volume,
+          priv->normal_sink_name ? priv->normal_sink_name : "(null)",
+          priv->sink_id);
+}
+
+static void
+bind_sink(SoundsStatusMenuItem *menu_item, uint32_t id)
+{
+  SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
+  uint32_t props[] = { SPA_PARAM_Props };
+
+  if (priv->sink_proxy)
+  {
+    if (priv->sink_id == id)
+      return;
+
+    clear_sink(menu_item);
+  }
+
+  priv->sink_proxy = pw_registry_bind(priv->pw_registry, id,
+                                      PW_TYPE_INTERFACE_Node, PW_VERSION_NODE,
+                                      0);
+  if (!priv->sink_proxy)
+  {
+    g_warning("VOLUME: failed to bind sink %u (%s)", id,
+              priv->normal_sink_name ? priv->normal_sink_name : "");
+    return;
+  }
+
+  priv->sink_id = id;
+
+  pw_proxy_add_object_listener(priv->sink_proxy, &priv->sink_hook,
+                               &sink_node_events, menu_item);
+
+  /* Subscribe first, then read, so a change landing between the two
+   * cannot be missed. */
+  pw_node_subscribe_params((struct pw_node *) priv->sink_proxy, props, 1);
+  read_sink_volume(menu_item);
+}
+
+static void
+clear_sink(SoundsStatusMenuItem *menu_item)
+{
+  SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
+
+  if (priv->sink_proxy)
+  {
+    spa_hook_remove(&priv->sink_hook);
+    pw_proxy_destroy(priv->sink_proxy);
+    priv->sink_proxy = NULL;
+  }
+
+  priv->sink_id = SPA_ID_INVALID;
+  priv->have_sink_props = FALSE;
+  priv->have_sink_volume = FALSE;
+  priv->have_target = FALSE;
+  priv->target = 0;
+  priv->normal_channels = 0;
+}
+
+static void
+resolve_sink(SoundsStatusMenuItem *menu_item)
+{
+  SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
+  gpointer value;
+
+  if (!priv->sink_ids || !priv->normal_sink_name)
+    return;
+
+  if (!g_hash_table_lookup_extended(priv->sink_ids, priv->normal_sink_name,
+                                   NULL, &value))
+  {
+    g_debug("VOLUME: sink %s has not appeared yet", priv->normal_sink_name);
+    return;
+  }
+
+  /* Skip only when this is the sink we are already on. Skipping whenever
+   * a proxy merely exists means a move to a different sink that is still
+   * present never happens: the old proxy keeps being followed, and the
+   * new device's ladder and level are never read -- a slider left showing
+   * one output while another is playing. */
+  if (priv->sink_proxy &&
+      priv->sink_id == (uint32_t) GPOINTER_TO_UINT(value))
+    return;
+
+  bind_sink(menu_item, (uint32_t) GPOINTER_TO_UINT(value));
+}
+
+/* Shared tail: pick the ladder for the current mode, sync the display, and
+ * turn a waiting key press into a step. */
+static void
+sink_state_changed(SoundsStatusMenuItem *menu_item, const char *why)
+{
+  SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
+  gboolean volume_changed = FALSE;
+  gint volume;
+  gint steps_size;
+  gint *steps;
+  double current_vol;
+  double new_vol;
 
   /* The source of truth for the slider depends on the mode.
    *
@@ -1369,19 +2181,17 @@ prop_sink_info_cb(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
    * role-based detector replaced the stream-restore read callback there is
    * no other producer for the media case. */
   if (priv->call_active)
-  {
     volume = priv->volume;
-  }
   else
   {
-    if (!i->volume.channels)
-    {
-      g_warning("VOLUME: %s: can't set volume from sink with zero channels",
-                __func__);
-      return;
-    }
+    /* Out of a call the slider reads the target, never the sink.  Reading
+     * the sink would let the policy move the control, and the next
+     * relative step is computed from whatever is showing -- so a policy
+     * lift for an alarm would silently rebase the user's ladder. */
+    if (!priv->have_target)
+      { g_debug("VOLUME T: gate blocked, no target"); return; }
 
-    volume = i->volume.values[0];
+    volume = priv->target;
     priv->volume = volume;
   }
 
@@ -1396,8 +2206,33 @@ prop_sink_info_cb(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
     steps_size = priv->normal_volume_num_steps;
   }
 
-  g_debug("VOLUME: %s: %s volume is now %i", __func__,
-          priv->call_active ? "in-call" : "normal", priv->volume);
+  /* Nothing to map the reported level onto, and no key step to serve.
+   * The keys are ignored rather than guessed at: a step computed against
+   * a missing table would move the hardware to a level nobody chose. A
+   * level we already hold is parked so the ladder can replay it, which
+   * is the common case at startup -- the target and the ladder arrive on
+   * different channels. */
+  if (steps == NULL || steps_size < 2)
+  {
+    priv->deferred_state_sync = TRUE;
+    return;
+  }
+
+  /* Not a volume change: this runs for every sink event, the target
+   * arriving back from the metadata, the node's volume mirror, the node's
+   * properties, a change of usability, and it prints the target we hold,
+   * not a value read from the sink. One key press produces four of these
+   * for one level, so only a change of the level shown is worth a line. */
+  {
+    static gint last_shown = -1;
+
+    if (priv->volume != last_shown)
+      {
+        last_shown = priv->volume;
+        g_debug("VOLUME: %s(%s): %s level shown is %i", __func__, why,
+                priv->call_active ? "in-call" : "normal", priv->volume);
+      }
+  }
 
   current_vol = pa_vol_to_slider(volume, steps, steps_size);
 
@@ -1421,12 +2256,12 @@ prop_sink_info_cb(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
      * comparisons -- so an async read could not move the widget at all.
      * Populating the slider here was needed for a cold start, but it made
      * every read a writer to the same widget the banner reads at expose
-     * time, and context_subscribe_cb() fires this read on every SINK
-     * CHANGE, including the ones PipeWire emits for state, latency and
-     * port changes that have nothing to do with volume.  A read issued
-     * before our write lands can therefore complete after we have already
-     * moved the slider forward and pull it back to the pre-write value,
-     * which is the banner showing a level one press behind.
+     * time, and a sink change notification fires this read on every CHANGE,
+     * including the ones PipeWire emits for state, latency and port changes
+     * that have nothing to do with volume.  A read issued before our write
+     * lands can therefore complete after we have already moved the slider
+     * forward and pull it back to the pre-write value, which is the banner
+     * showing a level one press behind.
      *
      * volume_changed is set for the window right after a write, which
      * covers press -> expose.  Cold start still populates, because then
@@ -1492,65 +2327,7 @@ out:
     update_slider(menu_item);
 }
 
-/* Push a volume to whichever sink we are currently tracking.
- *
- * Used for the media path.  During a call that has a host stream the level
- * goes to the stream instead (see apply_call_volume), so the sink keeps
- * the media level the user set.  A circuit-switched call has no host
- * stream at all and still arrives here, onto the call node that
- * follow_default_sink() re-pointed normal_sink_name at when the UCM
- * profile switch destroyed the media sink -- which is why there is no
- * separate "incall sink" to name.
- *
- * The operation is kept referenced so the previous one can be released
- * without losing track of it; the last one is released in dispose(). */
-static void
-apply_sink_volume(SoundsStatusMenuItem *menu_item, int volume)
-{
-  SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
-  pa_cvolume cv;
-  pa_operation *o;
-  pa_operation *prev;
-  gboolean prev_running;
-
-  if (!priv->pa_context)
-    return;
-
-  if (priv->normal_channels == 0)
-  {
-    g_warning("VOLUME: no channel count for sink %s yet, not setting volume",
-              priv->normal_sink_name ? priv->normal_sink_name : "(null)");
-    return;
-  }
-
-  pa_cvolume_set(&cv, priv->normal_channels, (pa_volume_t) volume);
-
-  o = pa_context_set_sink_volume_by_name(priv->pa_context,
-                                        priv->normal_sink_name, &cv,
-                                        error_callback, NULL);
-  if (!o)
-  {
-    g_warning("VOLUME: Pulse audio failure: %s %s",
-              pa_strerror(pa_context_errno(priv->pa_context)),
-              priv->normal_sink_name);
-    return;
-  }
-
-  prev = priv->pa_operation;
-  /* Read the old state before dropping the reference, not after. */
-  prev_running = prev && pa_operation_get_state(prev) == PA_OPERATION_RUNNING;
-  priv->pa_operation = o;
-
-  if (prev)
-    pa_operation_unref(prev);
-
-  g_debug("VOLUME: pushed %u to %s; tracking op %p (%s), superseded %p (%s)",
-          (unsigned) volume, priv->normal_sink_name, (void *) o,
-          pa_operation_get_state(o) == PA_OPERATION_RUNNING ? "running" : "done",
-          (void *) prev, prev_running ? "was still running" : "already finished");
-}
-
-/* Push the current level to every sink input carrying a call role.
+/* Push the current level to every tracked call stream.
  *
  * This is what makes media and VOIP independent.  Writing the sink moves
  * the call and the media together; writing the stream leaves the media
@@ -1558,66 +2335,38 @@ apply_sink_volume(SoundsStatusMenuItem *menu_item, int volume)
  * keyed on media.role, so the call level also survives a stack restart
  * with nothing for this applet to persist.
  *
- * The writes are issued from inside the enumeration callback on purpose.
- * The server snapshots the list before the callback runs, so writing does
- * not disturb iteration, and there is no index list to keep alive between
- * calls.  Every call-role stream gets the same value: "the call volume"
- * is one number, not one per app.
- */
-static void
-call_volume_write_cb(pa_context *c, const pa_sink_input_info *i, int eol,
-                    void *userdata)
-{
-  SoundsStatusMenuItem *menu_item = userdata;
-  SoundsStatusMenuItemPrivate *priv;
-  pa_operation *o;
-  pa_cvolume cv;
-
-  priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
-
-  if (eol != 0 || !i)
-    return;
-
-  if (!is_call_media_role(pa_proplist_gets(i->proplist, PA_PROP_MEDIA_ROLE)))
-    return;
-
-  if (i->volume.channels == 0)
-    return;
-
-  pa_cvolume_set(&cv, i->volume.channels, (pa_volume_t) priv->volume);
-
-  o = pa_context_set_sink_input_volume(c, i->index, &cv, error_callback, NULL);
-  if (!o)
-  {
-    g_warning("VOLUME: failed to set call stream %u: %s", i->index,
-              pa_strerror(pa_context_errno(c)));
-    return;
-  }
-
-  g_debug("VOLUME: pushed %d to call stream %u (%s)", priv->volume, i->index,
-          pa_proplist_gets(i->proplist, PA_PROP_APPLICATION_NAME));
-  pa_operation_unref(o);
-}
-
+ * Every call stream gets the same value: "the call volume" is one number,
+ * not one per app. */
 static void
 apply_call_volume(SoundsStatusMenuItem *menu_item)
 {
   SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
-  pa_operation *o;
+  GHashTableIter iter;
+  gpointer value;
 
-  if (!priv->pa_context)
+  if (!priv->call_streams)
     return;
 
-  o = pa_context_get_sink_input_info_list(priv->pa_context,
-                                         call_volume_write_cb, menu_item);
-  if (!o)
+  g_hash_table_iter_init(&iter, priv->call_streams);
+  while (g_hash_table_iter_next(&iter, NULL, &value))
   {
-    g_warning("VOLUME: failed to enumerate call streams: %s",
-              pa_strerror(pa_context_errno(priv->pa_context)));
-    return;
-  }
+    struct call_stream *cs = value;
+    uint8_t buf[256];
+    struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
 
-  pa_operation_unref(o);
+    if (!cs->proxy || cs->channels == 0)
+      continue;
+
+    if (pw_node_set_param((struct pw_node *) cs->proxy, SPA_PARAM_Props,
+                          0, build_volume_pod(&b, priv->volume,
+                                               cs->channels)) < 0)
+    {
+      g_warning("VOLUME: failed to set call stream %u", cs->id);
+      continue;
+    }
+
+    g_debug("VOLUME: pushed %d to call stream %u", priv->volume, cs->id);
+  }
 }
 
 static void
@@ -1630,14 +2379,15 @@ set_volume(SoundsStatusMenuItem *menu_item, int volume)
   priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
 
   /* Route by mode.  In a call the level belongs to the stream so that
-   * media volume is not dragged along with it; out of a call there is no
-   * stream to write to and the sink is the only thing there is. */
+   * media volume is not dragged along with it; out of a call nothing is
+   * written to the sink at all -- the target goes to the policy and the
+   * policy drives the route. */
   priv->volume = volume;
 
   if (priv->call_active)
     apply_call_volume(menu_item);
   else
-    apply_sink_volume(menu_item, volume);
+    write_target(menu_item, volume);
 }
 
 static void
@@ -1648,6 +2398,12 @@ hscale_value_changed_cb(GtkRange *range, gpointer user_data)
   int pa_vol;
 
   priv->range_val = gtk_range_get_value(GTK_RANGE(range));
+
+  /* Belt against a drag that slips in while the table is gone; the widget
+   * is insensitive so this should not fire, but a write made from no
+   * ladder would set the volume from nothing. */
+  if (!have_ladder(priv))
+    return;
 
   if (priv->call_active)
   {
@@ -1668,17 +2424,10 @@ static void
 parent_window_map_cb(GtkWidget *widget, SoundsStatusMenuItem *menu_item)
 {
   SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
-  pa_operation *o;
 
   grab_keys(priv);
 
-  pa_subscribe_events(priv->pa_context);
-
-  o = pa_context_get_sink_info_by_name(priv->pa_context, priv->normal_sink_name,
-                                       prop_sink_info_cb, menu_item);
-
-  if (o)
-    pa_operation_unref(o);
+  read_sink_volume(menu_item);
 
   priv->parent_window_mapped = TRUE;
   update_slider(menu_item);
@@ -1730,7 +2479,6 @@ static void
 sounds_status_menu_item_init(SoundsStatusMenuItem *menu_item)
 {
   SoundsStatusMenuItemPrivate *priv = SOUND_STATUS_MENU_ITEM_PRIVATE(menu_item);
-  pa_glib_mainloop *m;
   GtkWidget *hbox;
   DBusConnection *conn;
   GError *error = NULL;
@@ -1740,8 +2488,7 @@ sounds_status_menu_item_init(SoundsStatusMenuItem *menu_item)
 
   priv->volume_changed = FALSE;
   priv->call_active = FALSE;
-  priv->pa_context = NULL;
-  priv->pa_operation = NULL;
+  priv->sink_id = SPA_ID_INVALID;
   priv->parent_signals_connected = FALSE;
   priv->parent_window_mapped = FALSE;
   priv->mm_key = 0;
@@ -1753,7 +2500,6 @@ sounds_status_menu_item_init(SoundsStatusMenuItem *menu_item)
   priv->native_landscape = FALSE;
 
   get_sinks(priv);
-  apply_default_tuning(priv);
   grab_keys(priv);
 
   gdk_window_set_events(GDK_ROOT_PARENT(),
@@ -1767,12 +2513,48 @@ sounds_status_menu_item_init(SoundsStatusMenuItem *menu_item)
   priv->size_changed_id = g_signal_connect(
       screen, "size-changed", G_CALLBACK(screen_size_changed_cb), menu_item);
 
-  m = pa_glib_mainloop_new(g_main_context_default());
-  g_assert(m);
+  priv->call_streams = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL,
+                                             call_stream_free);
+  priv->sink_ids = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
+                                         NULL);
 
-  priv->pa_loop = m;
-  priv->pa_api = pa_glib_mainloop_get_api(m);
-  reconnect(menu_item);
+  /* pw_main_loop_new() does not do this for us; without it the SPA plugin
+   * directory is unset and the loop cannot load its support.system handle. */
+  pw_init(NULL, NULL);
+
+  priv->pw_loop = pw_main_loop_new(NULL);
+  if (!priv->pw_loop)
+  {
+    g_warning("VOLUME: cannot create the PipeWire main loop; volume control "
+              "will be unavailable");
+  }
+  else if (pw_loop_get_fd(pw_main_loop_get_loop(priv->pw_loop)) < 0)
+  {
+    g_warning("VOLUME: the PipeWire main loop has no poll fd; volume control "
+              "will be unavailable");
+    pw_main_loop_destroy(priv->pw_loop);
+    priv->pw_loop = NULL;
+  }
+  else
+  {
+    /* Drive PipeWire off the GTK main loop.  pw_loop_get_fd() is the
+     * loop's real epoll fd -- IO sources, timerfds and the cross-thread
+     * control eventfd are all registered into it -- so watching it and
+     * calling pw_loop_iterate() with block=false runs every PipeWire
+     * callback on this thread alongside the X key grabs and the MCE
+     * D-Bus filter.  The channel does not own the fd, so it must not
+     * close it; the loop does. */
+    priv->pw_channel = g_io_channel_unix_new(
+                         pw_loop_get_fd(pw_main_loop_get_loop(priv->pw_loop)));
+    g_io_channel_set_close_on_unref(priv->pw_channel, FALSE);
+
+    priv->pw_bridge = g_io_create_watch(priv->pw_channel, G_IO_IN);
+    g_source_set_callback(priv->pw_bridge, (GSourceFunc) pw_bridge_cb,
+                           menu_item, NULL);
+    g_source_attach(priv->pw_bridge, g_main_context_default());
+
+    reconnect(menu_item);
+  }
 
   priv->dbus = dbus_g_bus_get(DBUS_BUS_SYSTEM, &error);
 
@@ -1794,6 +2576,8 @@ sounds_status_menu_item_init(SoundsStatusMenuItem *menu_item)
   gtk_box_pack_start(GTK_BOX(hbox), priv->image, FALSE, FALSE, 8);
 
   priv->hscale = hildon_gtk_hscale_new();
+  /* Nothing to map until a sink publishes a ladder. */
+  gtk_widget_set_sensitive(priv->hscale, FALSE);
   gtk_box_pack_start(GTK_BOX(hbox), priv->hscale, TRUE, TRUE, 8);
   priv->hscale_value_changed_id =
     g_signal_connect(priv->hscale, "value-changed",

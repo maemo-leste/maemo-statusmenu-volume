@@ -31,8 +31,8 @@ PKG_CHECK_MODULES(STATUS_MENU_VOLUME,
 		hildon-1 dnl
 		libhildondesktop-1 dnl
 		libosso dnl
-		libpulse dnl
-		libpulse-mainloop-glib dnl
+		libpipewire-0.3 dnl
+		libspa-0.2 dnl
 		mce dnl
 		x11 dnl
 	])

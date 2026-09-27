@@ -3,13 +3,13 @@ Section: libs
 Priority: optional
 Maintainer: Ivaylo Dimitrov <ivo.g.dimitrov.75@gmail.com>
 Build-Depends: debhelper (>= 9), autotools-dev, libhildondesktop1-dev,
- libhildon1-dev, libosso-dev, libpulse-dev, osso-af-settings,
+ libhildon1-dev, libosso-dev, libpipewire-0.3-dev, libspa-0.2-dev, osso-af-settings,
  osso-systemui-tklock-dev, mce-dev
 Standards-Version: 3.7.2
 
 Package: maemo-statusmenu-volume
 Architecture: any
 Multi-Arch: same
-Depends: ${shlibs:Depends}, ${misc:Depends}, hildon-libs-l10n-mr0 | hildon-libs-l10n-mr
+Depends: ${shlibs:Depends}, ${misc:Depends}, maemo-audio (>= 2.0.0), hildon-libs-l10n-mr0 | hildon-libs-l10n-mr
 Description: Volume status menu plugin
  This package contains the status menu plugin for sound volume slider
