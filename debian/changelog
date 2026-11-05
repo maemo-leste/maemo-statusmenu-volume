@@ -1,3 +1,15 @@
+maemo-statusmenu-volume (2.0) unstable; urgency=medium
+
+  * Move to native PipeWire, libpulse is gone
+  * Depends on maemo-audio, the policy that turns the published target into a hardware level
+  * The level is published as x-maemo.volume.target on the sink node, the policy drives the card route from it
+  * The slider reads the target rather than the sink, a policy lift cannot rebase the ladder
+  * Ladders and channel count are read from the sink node, the incall ladder applies while a phone or Communication stream is live
+  * A level that has not arrived yet is parked instead of guessed at
+  * An unchanged target is ignored, the debug line prints only when the level on screen moves
+
+ -- Ivaylo Dimitrov <ivo.g.dimitrov.75@gmail.com>  Thu, 05 Nov 2026 21:04:55 +0200
+
 maemo-statusmenu-volume (1.0) unstable; urgency=medium
 
   * New tuning format: x-maemo.volume.tuning and .incall, ascending centibels
